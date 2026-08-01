@@ -3036,6 +3036,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             websocketLoop(config, classLoader);
         } catch (Throwable t) {
             logWebSocketFailure("outbox websocket unavailable: " + shortError(t));
+            return false;
         }
         return false;
     }

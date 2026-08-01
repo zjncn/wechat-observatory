@@ -266,6 +266,7 @@ func (s *Service) RegisterModule(ctx context.Context, req ModuleRegistrationRequ
 		Kind:   "register",
 	})
 	s.cfg.Devices[req.Device] = device
+	s.notifyOutbox(req.Device)
 	return &ModuleRegistrationResult{
 		Device: moduleDeviceView(device),
 	}, nil
