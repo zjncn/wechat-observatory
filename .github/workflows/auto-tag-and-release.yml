@@ -23,24 +23,36 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get latest tag
-        id: latest_tag
+      # Derive the next version from the newest proper vX.Y.Z tag only.
+      # Ignore the rolling "android-build-latest" tag (created by android-build.yml)
+      # and any non-semver/garbage tags, otherwise version math breaks.
+      - name: Derive next version
+        id: version
         run: |
-          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          if [ -z "$TAG" ]; then
-            echo "tag=v0.2.1" >> $GITHUB_OUTPUT
+          LAST_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+          if [ -z "$LAST_TAG" ]; then
+            echo "tag=v0.2.1" >> "$GITHUB_OUTPUT"
           else
-            VERSION=${TAG#v}
-            MAJOR=$(echo $VERSION | cut -d. -f1)
-            MINOR=$(echo $VERSION | cut -d. -f2)
-            PATCH=$(echo $VERSION | cut -d. -f3)
+            VERSION="${LAST_TAG#v}"
+            MAJOR=$(printf '%s' "$VERSION" | cut -d. -f1)
+            MINOR=$(printf '%s' "$VERSION" | cut -d. -f2)
+            PATCH=$(printf '%s' "$VERSION" | cut -d. -f3)
             NEW_PATCH=$((PATCH + 1))
-            echo "tag=v${MAJOR}.${MINOR}.${NEW_PATCH}" >> $GITHUB_OUTPUT
+            echo "tag=v${MAJOR}.${MINOR}.${NEW_PATCH}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create tag
+      - name: Create and push tag
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a ${{ steps.latest_tag.outputs.tag }} -m "Release ${{ steps.latest_tag.outputs.tag }}"
-          git push origin ${{ steps.latest_tag.outputs.tag }}
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      # Tags pushed via GITHUB_TOKEN do NOT trigger other workflows, so we must
+      # explicitly dispatch the release build (android-release.yml) that produces
+      # the visible GitHub release + APK asset.
+      - name: Dispatch Android release build
+        run: |
+          gh workflow run android-release.yml \
+            --ref "${{ steps.version.outputs.tag }}" \
+            -f release_tag="${{ steps.version.outputs.tag }}"
