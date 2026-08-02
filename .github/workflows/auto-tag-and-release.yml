@@ -52,6 +52,8 @@ jobs:
       # explicitly dispatch the release build (android-release.yml) that produces
       # the visible GitHub release + APK asset.
       - name: Dispatch Android release build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh workflow run android-release.yml \
             --ref "${{ steps.version.outputs.tag }}" \
