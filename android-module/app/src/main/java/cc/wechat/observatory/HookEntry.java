@@ -620,11 +620,11 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     }
                     if (!isWeChatReadyForSend(classLoader)) {
                         log("WeChat send stack not ready; skip outbox poll");
-                        if (!sleepOnce(Math.max(5000L, config.pollIntervalMs))) {
-                            return;
-                        }
-                        continue;
                     }
+                    // Message upload and contact sync do NOT depend on the send stack.
+                    // The send stack check gates outbox (server→phone), but pollMessagesIfDue
+                    // only reads the local DB and posts to the server — decouple it so
+                    // message reporting is never frozen by send-stack initialization delays.
                     syncContactsIfDue(config);
                     pollMessagesIfDue(config);
                 }
