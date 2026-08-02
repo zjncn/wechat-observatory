@@ -87,7 +87,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final AtomicBoolean WORKER_STARTED = new AtomicBoolean(false);
     private static final AtomicBoolean OUTBOX_WORKER_STARTED = new AtomicBoolean(false);
     private static final AtomicBoolean EXTERNAL_STORAGE_FALLBACK_HOOKED = new AtomicBoolean(false);
-    private static final ExecutorService POST_EXECUTOR = Executors.newSingleThreadExecutor(new ThreadFactory() {
+    private static final ExecutorService POST_EXECUTOR = Executors.newFixedThreadPool(4, new ThreadFactory() {
         @Override
         public Thread newThread(Runnable runnable) {
             Thread thread = new Thread(runnable, "wechat-observatory-post");
@@ -107,6 +107,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile int MESSAGE_POLL_CONSECUTIVE_FAILS = 0;
     private static volatile long MESSAGE_POLL_BACKOFF_UNTIL = 0L;
     private static volatile long LAST_MESSAGE_POLL_FAIL_LOG_AT = 0L;
+    private static final long MESSAGE_POLL_BACKOFF_MS = 5000L;
     private static final long[] MEDIA_RETRY_DELAYS_MS = new long[]{3000L, 10000L, 30000L, 120000L};
     private static final Set<Long> MEDIA_RETRY_SCHEDULED_IDS = new HashSet<>();
     private static final Set<Long> MEDIA_UPLOAD_REPORTED_IDS = new HashSet<>();
@@ -1152,9 +1153,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     + " error=" + shortError(cause));
         }
         if (MESSAGE_POLL_CONSECUTIVE_FAILS >= 3) {
-            long backoffMs = Math.min(10L * 60L * 1000L, 30000L * MESSAGE_POLL_CONSECUTIVE_FAILS);
-            MESSAGE_POLL_BACKOFF_UNTIL = now + backoffMs;
-            log("message poll backoff seconds=" + (backoffMs / 1000L)
+            MESSAGE_POLL_BACKOFF_UNTIL = now + MESSAGE_POLL_BACKOFF_MS;
+            log("message poll backoff seconds=" + (MESSAGE_POLL_BACKOFF_MS / 1000L)
                     + " reason=" + shortError(cause));
         }
     }
@@ -1216,7 +1216,6 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 if (msgId <= LAST_MESSAGE_ID) {
                     continue;
                 }
-                LAST_MESSAGE_ID = msgId;
 
                 long msgSvrId = queryMode == 2 ? longColumn(cursor, column++) : 0L;
                 String talker = stringColumn(cursor, column++);
@@ -1226,6 +1225,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 int type = intColumn(cursor, column++);
                 String imgPath = queryMode >= 1 ? stringColumn(cursor, column) : "";
                 if (!shouldReportMessage(talker, content, type)) {
+                    LAST_MESSAGE_ID = msgId;
                     continue;
                 }
 
@@ -1234,6 +1234,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 String mediaHint = resolveMediaHint(db, messageType, Long.valueOf(msgId), serverId, imgPath);
                 MessagePayload payload = buildMessagePayload(config, talker, content, isSend == 1 ? Integer.valueOf(1) : Integer.valueOf(0), msgId, createTime, messageType, mediaHint);
                 post(config, payload);
+                LAST_MESSAGE_ID = msgId;
                 rememberMediaUpload(payload);
                 scheduleMediaRetryIfNeeded(config, talker, content, isSend == 1 ? Integer.valueOf(1) : Integer.valueOf(0), msgId, serverId, createTime, messageType, mediaHint, payload);
                 count++;
