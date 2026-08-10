@@ -28,7 +28,7 @@ WeChat Observatory（微信看台）是一个通过 Android LSPosed 模块接入
 
 这个项目只做微信网关能力，不包含游戏业务、命令解析、自动回复、扫码登录或第三方协议登录。
 
-当前 Android LSPosed 模块面向微信 Android `8.0.75` 适配。微信内部实现随版本变化，升级微信后需要重新验证消息观察、联系人同步、媒体上传和发送路径。
+当前 Android LSPosed 模块面向微信 Android `8.0.75`、`8.0.76` 适配。微信内部实现随版本变化，升级微信后需要重新验证消息观察、联系人同步、媒体上传和发送路径。
 
 ```text
 微信消息 -> LSPosed 模块 -> 网关入库和实时推送 -> Web 管理台
@@ -70,7 +70,7 @@ docs                       详细文档
 - MySQL 8+，生产建议使用 MySQL
 - Android Studio / Android SDK，用于构建 LSPosed 模块
 - 已 Root 的 Android 手机、LSPosed、微信
-- 微信 Android `8.0.75`
+- 微信 Android `8.0.75` 或 `8.0.76`
 
 ### 2. 启动服务端
 

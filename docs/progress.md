@@ -8,7 +8,7 @@
 - 数据库工具入口为 `cmd/bridge-db`。
 - Web 管理台使用 React 和 shadcn 风格组件，构建产物嵌入 Go 服务。
 - Android 模块包名为 `cc.wechat.observatory`。
-- Android 模块公开适配目标为微信 Android `8.0.75`。
+- Android 模块公开适配目标为微信 Android `8.0.75`、`8.0.76`。
 - 模块认证只使用 API Key。
 - 模块在微信进程内自动识别当前 `wxid`，用户不需要手动填写。
 - 设备显示名由 Web 管理端设置。

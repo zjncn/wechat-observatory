@@ -9,7 +9,7 @@
 - MySQL 8+，生产环境建议使用 MySQL
 - Android Studio / Android SDK
 - 已 Root 的 Android 手机、LSPosed、微信
-- 微信 Android `8.0.75`
+- 微信 Android `8.0.75` 或 `8.0.76`
 
 ## 2. 启动服务端
 

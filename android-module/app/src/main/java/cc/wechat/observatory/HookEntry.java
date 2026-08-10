@@ -123,6 +123,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile long LAST_USER_SKIP_LOG_AT = 0L;
     private static volatile Context APP_CONTEXT;
     private static volatile ClassLoader WECHAT_CLASS_LOADER;
+    private static volatile WeChatVersionSymbols.Profile WECHAT_SYMBOLS;
+    private static volatile ClassLoader WECHAT_SYMBOLS_CLASS_LOADER;
 
     private static final class QuoteSource {
         long msgId;
@@ -723,12 +725,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
         try {
             classLoader = runtimeClassLoader(classLoader);
             WECHAT_CLASS_LOADER = classLoader;
-            ensureWeChatRegistries(classLoader);
-            if (!isStaticArraySlotReady(classLoader, "fs.g", "f283324a", "a")) {
+            WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
+            ensureWeChatRegistries(classLoader, symbols);
+            if (symbols.extensionRegistryRequired
+                    && !isStaticArraySlotReady(classLoader, "fs.g", "f283324a", "a")) {
                 return readyState(false, "fs.g extension registry not initialized");
             }
-            if (!isStaticBooleanFlag(classLoader, "i95.n0", "f307062f", "f")) {
-                return readyState(false, "i95.n0 service manager not initialized");
+            String serviceManager = symbols.className("i95.n0");
+            if (!isStaticBooleanFlag(classLoader, serviceManager, "f307062f", "f")) {
+                return readyState(false, serviceManager + " service manager not initialized");
             }
             return readyState(true, "ready");
         } catch (Throwable t) {
@@ -736,7 +741,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    private static void ensureWeChatRegistries(ClassLoader classLoader) throws Exception {
+    private static void ensureWeChatRegistries(
+            ClassLoader classLoader,
+            WeChatVersionSymbols.Profile symbols) throws Exception {
         classLoader = runtimeClassLoader(classLoader);
         Class<?> appContext = findClass(classLoader, "com.tencent.mm.sdk.platformtools.x2");
         Object application = findFieldAny(appContext, "f210311a", "a").get(null);
@@ -752,31 +759,37 @@ public final class HookEntry implements IXposedHookLoadPackage {
             log("initialized WeChat MMApplicationContext from module");
         }
 
-        Class<?> extensionRegistry = findClass(classLoader, "fs.g");
-        Field registryField = findFieldAny(extensionRegistry, "f283324a", "a");
-        Object registryArray = registryField.get(null);
-        if (registryArray != null
-                && registryArray.getClass().isArray()
-                && java.lang.reflect.Array.getLength(registryArray) > 0
-                && java.lang.reflect.Array.get(registryArray, 0) == null) {
-            java.lang.reflect.Array.set(registryArray, 0, enumConstant(classLoader, "fs.k2", "INSTANCE"));
-            findFieldAny(extensionRegistry, "f283326c", "c").set(null, application);
-            findFieldAny(extensionRegistry, "f283325b", "b").set(null, enumConstant(classLoader, "com.tencent.mm.app.q0", "INSTANCE"));
-            log("initialized fs.g extension registry from module");
+        if (symbols.extensionRegistryRequired) {
+            Class<?> extensionRegistry = findClass(classLoader, "fs.g");
+            Field registryField = findFieldAny(extensionRegistry, "f283324a", "a");
+            Object registryArray = registryField.get(null);
+            if (registryArray != null
+                    && registryArray.getClass().isArray()
+                    && java.lang.reflect.Array.getLength(registryArray) > 0
+                    && java.lang.reflect.Array.get(registryArray, 0) == null) {
+                java.lang.reflect.Array.set(registryArray, 0, enumConstant(classLoader, "fs.k2", "INSTANCE"));
+                findFieldAny(extensionRegistry, "f283326c", "c").set(null, application);
+                findFieldAny(extensionRegistry, "f283325b", "b").set(
+                        null,
+                        enumConstant(classLoader, "com.tencent.mm.app.q0", "INSTANCE"));
+                log("initialized fs.g extension registry from module");
+            }
         }
 
-        if (!isStaticBooleanFlag(classLoader, "i95.n0", "f307062f", "f")) {
+        String serviceManagerName = symbols.className("i95.n0");
+        if (symbols.forceServiceInitialization
+                && !isStaticBooleanFlag(classLoader, serviceManagerName, "f307062f", "f")) {
             Class<?> providerClass = findClass(classLoader, "com.tencent.mm.app.p0");
             Object provider = findFieldAny(providerClass, "f70808d", "d").get(null);
             Object y = findMethod(provider.getClass(), "b").invoke(provider);
             Method initialize = findMethod(
-                    findClass(classLoader, "i95.n0"),
+                    findClass(classLoader, serviceManagerName),
                     "d",
                     Application.class,
-                    findClass(classLoader, "i95.y"),
-                    findClass(classLoader, "k95.a"));
+                    findClass(classLoader, symbols.className("i95.y")),
+                    findClass(classLoader, symbols.className("k95.a")));
             initialize.invoke(null, application, y, enumConstant(classLoader, "com.tencent.mm.app.q0", "INSTANCE"));
-            log("initialized i95.n0 service manager from module");
+            log("initialized " + serviceManagerName + " service manager from module");
         }
     }
 
@@ -873,14 +886,44 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static ClassLoader firstLoadable(List<ClassLoader> candidates) {
         for (ClassLoader candidate : candidates) {
             try {
-                Class.forName("w11.r0", false, candidate);
-                Class.forName("i95.n0", false, candidate);
+                detectWeChatSymbols(candidate);
                 return candidate;
             } catch (Throwable ignored) {
                 // Try the next candidate.
             }
         }
         return null;
+    }
+
+    private static WeChatVersionSymbols.Profile detectWeChatSymbols(final ClassLoader classLoader) {
+        return WeChatVersionSymbols.resolve(new WeChatVersionSymbols.ClassProbe() {
+            @Override
+            public boolean isPresent(String className) {
+                try {
+                    Class.forName(className, false, classLoader);
+                    return true;
+                } catch (Throwable ignored) {
+                    return false;
+                }
+            }
+        });
+    }
+
+    private static WeChatVersionSymbols.Profile weChatSymbols(ClassLoader classLoader) {
+        WeChatVersionSymbols.Profile symbols = WECHAT_SYMBOLS;
+        if (symbols != null && WECHAT_SYMBOLS_CLASS_LOADER == classLoader) {
+            return symbols;
+        }
+        symbols = detectWeChatSymbols(classLoader);
+        WECHAT_SYMBOLS = symbols;
+        WECHAT_SYMBOLS_CLASS_LOADER = classLoader;
+        log("detected WeChat runtime symbols version=" + symbols.version);
+        return symbols;
+    }
+
+    private static Class<?> findVersionedClass(ClassLoader classLoader, String baselineName)
+            throws ClassNotFoundException {
+        return findClass(classLoader, weChatSymbols(classLoader).className(baselineName));
     }
 
     private static boolean readyState(boolean ready, String reason) {
@@ -3911,23 +3954,25 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static String voiceStoragePath(ClassLoader classLoader, String voiceFileName, boolean audioScoped) throws Exception {
-        Class<?> storageInterface = findClass(classLoader, "tg3.u0");
-        Object storage = findMethod(findClass(classLoader, "i95.n0"), "c", Class.class).invoke(null, storageInterface);
+        WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
+        Class<?> storageInterface = findVersionedClass(classLoader, "tg3.u0");
+        Object storage = findMethod(findVersionedClass(classLoader, "i95.n0"), "c", Class.class).invoke(null, storageInterface);
         if (storage == null) {
             throw new IllegalStateException("voice storage service is not available");
         }
-        Class<?> yClass = findClass(classLoader, "bm5.y");
+        Class<?> yClass = findVersionedClass(classLoader, "bm5.y");
         Object voiceResource;
         if (audioScoped) {
             Object builder = findField(yClass, "i").get(null);
-            Class<?> oi3Class = findClass(classLoader, "oi3.g");
-            Class<?> f0Class = findClass(classLoader, "bm5.f0");
+            Class<?> oi3Class = findVersionedClass(classLoader, "oi3.g");
+            Class<?> f0Class = findVersionedClass(classLoader, "bm5.f0");
             Object audioType = findField(f0Class, "u").get(null);
             voiceResource = findMethod(builder.getClass(), "d", oi3Class, f0Class).invoke(builder, null, audioType);
         } else {
             voiceResource = findField(yClass, "j").get(null);
         }
-        Method fullPath = findMethod(storage.getClass(), "vj", yClass, String.class, boolean.class);
+        String pathMethod = symbols.featureServiceSendStack ? "Mj" : "vj";
+        Method fullPath = findMethod(storage.getClass(), pathMethod, yClass, String.class, boolean.class);
         Object path = fullPath.invoke(storage, voiceResource, voiceFileName, true);
         String value = path == null ? "" : String.valueOf(path);
         if (isBlank(value)) {
@@ -4414,7 +4459,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return SendResult.failed("wxid, appmsg_title, and appmsg_url are required");
         }
         try {
-            Class<?> appMsgClass = findClass(classLoader, "ot0.q");
+            Class<?> appMsgClass = findVersionedClass(classLoader, "ot0.q");
             Object appMsg = appMsgClass.getDeclaredConstructor().newInstance();
             setObjectField(appMsg, title, "f");
             setObjectField(appMsg, description == null ? "" : description, "g");
@@ -4442,7 +4487,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return SendResult.failed("wxid, appmsg_title, mini_program_username, and mini_program_page_path are required");
         }
         try {
-            Class<?> appMsgClass = findClass(classLoader, "ot0.q");
+            Class<?> appMsgClass = findVersionedClass(classLoader, "ot0.q");
             Object appMsg = appMsgClass.getDeclaredConstructor().newInstance();
             setObjectField(appMsg, title, "f");
             setObjectField(appMsg, description == null ? "" : description, "g");
@@ -4504,7 +4549,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         if (isBlank(sourceContent)) {
             return null;
         }
-        Class<?> appMsgClass = findClass(classLoader, "ot0.q");
+        Class<?> appMsgClass = findVersionedClass(classLoader, "ot0.q");
         Object parsed = findMethod(appMsgClass, "v", String.class).invoke(null, sourceContent);
         return appMsgClass.isInstance(parsed) ? parsed : null;
     }
@@ -4550,7 +4595,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static long sendViaAppMsgObject(ClassLoader classLoader, String wxid, Object appMsg) throws Exception {
-        Class<?> appMsgClass = findClass(classLoader, "ot0.q");
+        Class<?> appMsgClass = findVersionedClass(classLoader, "ot0.q");
         Class<?> appMsgLogicClass = findClass(classLoader, "com.tencent.mm.pluginsdk.model.app.k0");
         Method send = findMethod(appMsgLogicClass, "I", appMsgClass,
                 String.class, String.class, String.class, String.class, byte[].class);
@@ -4696,7 +4741,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static long sendViaQuoteAppMsg(ClassLoader classLoader, String wxid, String text, QuoteSource source) throws Exception {
-        Class<?> appMsgClass = findClass(classLoader, "ot0.q");
+        Class<?> appMsgClass = findVersionedClass(classLoader, "ot0.q");
         Object appMsg = appMsgClass.getDeclaredConstructor().newInstance();
         setObjectField(appMsg, text, "f");
         setIntFieldAny(appMsg, APPMSG_TYPE_QUOTE, "i");
@@ -4722,7 +4767,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static long sendViaChatHistoryAppMsg(ClassLoader classLoader, String wxid, String title, String description, String recordItemXML) throws Exception {
-        Class<?> appMsgClass = findClass(classLoader, "ot0.q");
+        Class<?> appMsgClass = findVersionedClass(classLoader, "ot0.q");
         Object appMsg = appMsgClass.getDeclaredConstructor().newInstance();
         setObjectField(appMsg, title, "f");
         setObjectField(appMsg, description == null ? "" : description, "g");
@@ -4813,7 +4858,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return "";
         }
         try {
-            Object value = findMethod(findClass(classLoader, "c01.ia"), "t", String.class).invoke(null, msgSource);
+            Object value = findMethod(findVersionedClass(classLoader, "c01.ia"), "t", String.class).invoke(null, msgSource);
             return value == null ? "" : String.valueOf(value);
         } catch (Throwable ignored) {
             return "";
@@ -4821,23 +4866,29 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static boolean insertMsgQuoteRecord(ClassLoader classLoader, long newMsgId, QuoteSource source) throws Exception {
-        Class<?> pluginInterface = findClass(classLoader, "aa0.e");
-        Object plugin = findMethod(findClass(classLoader, "i95.n0"), "c", Class.class).invoke(null, pluginInterface);
+        WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
+        Class<?> pluginInterface = findVersionedClass(classLoader, "aa0.e");
+        Object plugin = findMethod(findVersionedClass(classLoader, "i95.n0"), "c", Class.class).invoke(null, pluginInterface);
         if (plugin == null) {
             throw new IllegalStateException("msgquote plugin service is unavailable");
         }
-        Object storage = findNoArgMethod(plugin.getClass(), "Di").invoke(plugin);
+        Object storage = findNoArgMethod(
+                plugin.getClass(),
+                symbols.featureServiceSendStack ? "lj" : "Di").invoke(plugin);
         if (storage == null) {
             throw new IllegalStateException("MsgQuote storage is unavailable");
         }
 
-        Class<?> recordClass = findClass(classLoader, "ui3.b");
+        Class<?> recordClass = findVersionedClass(classLoader, "ui3.b");
         Object record = recordClass.getDeclaredConstructor().newInstance();
         setLongFieldAny(record, newMsgId, "field_msgId");
         setLongFieldAny(record, source.msgId, "field_quotedMsgId");
         setLongFieldAny(record, source.msgSvrId, "field_quotedMsgSvrId");
         setObjectField(record, source.talker, "field_quotedMsgTalker");
-        Object result = findMethod(storage.getClass(), "J0", recordClass).invoke(storage, record);
+        Method insert = symbols.featureServiceSendStack
+                ? findMethod(storage.getClass(), "insert", findClass(classLoader, "s85.f0"))
+                : findMethod(storage.getClass(), "J0", recordClass);
+        Object result = insert.invoke(storage, record);
         return Boolean.TRUE.equals(result);
     }
 
@@ -4861,13 +4912,39 @@ public final class HookEntry implements IXposedHookLoadPackage {
         if (context == null) {
             throw new IllegalStateException("WeChat context is not available");
         }
-        Class<?> accessorClass = findClass(classLoader, "tg3.t1");
-        Method accessor = findNoArgMethod(accessorClass, "a");
-        Object service = accessor.invoke(null);
-        if (service == null) {
-            throw new IllegalStateException("tg3.t1.a returned null");
+        WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
+        Object service;
+        if (symbols.featureServiceSendStack) {
+            Class<?> serviceInterface = findClass(classLoader, "qh3.a1");
+            service = findMethod(findVersionedClass(classLoader, "i95.n0"), "c", Class.class)
+                    .invoke(null, serviceInterface);
+        } else {
+            Class<?> accessorClass = findClass(classLoader, "tg3.t1");
+            Method accessor = findNoArgMethod(accessorClass, "a");
+            service = accessor.invoke(null);
         }
-        Class<?> forwardInfoClass = findClass(classLoader, "c01.h7");
+        if (service == null) {
+            throw new IllegalStateException("image send service is not available");
+        }
+        Class<?> forwardInfoClass = findVersionedClass(classLoader, "c01.h7");
+        if (symbols.featureServiceSendStack) {
+            try {
+                Method send = findMethod(service.getClass(), "rj",
+                        Context.class, String.class, String.class, int.class,
+                        String.class, String.class, forwardInfoClass);
+                send.invoke(service, context, wxid, imageFile.getAbsolutePath(), 1, "", "", null);
+                return;
+            } catch (NoSuchMethodException unavailable) {
+                Class<?> scanCodeInfoClass = findClass(classLoader, "com.tencent.mm.modelscan.ScanCodeInfo");
+                Class<?> sourceImgInfoClass = findClass(classLoader, "com.tencent.mm.modelmulti.SourceImgInfo");
+                Method send = findMethod(service.getClass(), "vj",
+                        Context.class, String.class, String.class, int.class,
+                        String.class, String.class, forwardInfoClass,
+                        scanCodeInfoClass, sourceImgInfoClass);
+                send.invoke(service, context, wxid, imageFile.getAbsolutePath(), 1, "", "", null, null, null);
+                return;
+            }
+        }
         try {
             Method send = findMethod(service.getClass(), "Vi",
                     Context.class, String.class, String.class, int.class, String.class, String.class, forwardInfoClass);
@@ -4884,11 +4961,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void sendViaVideoSendFeature(ClassLoader classLoader, String wxid, File videoFile) throws Exception {
-        Class<?> r2Class = findClass(classLoader, "vf0.r2");
+        WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
+        Class<?> r2Class = findVersionedClass(classLoader, "vf0.r2");
         Object crossParams = defaultVideoCrossParams(classLoader, r2Class);
 
-        Class<?> forwardInfoClass = findClass(classLoader, "c01.h7");
-        Class<?> u2Class = findClass(classLoader, "vf0.u2");
+        Class<?> forwardInfoClass = findVersionedClass(classLoader, "c01.h7");
+        Class<?> u2Class = findVersionedClass(classLoader, "vf0.u2");
         Constructor<?> elementCtor = findConstructor(
                 u2Class,
                 String.class,
@@ -4907,25 +4985,28 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 crossParams,
                 null);
 
-        Class<?> i3Class = findClass(classLoader, "vf0.i3");
-        Class<?> h3Class = findClass(classLoader, "vf0.h3");
+        Class<?> i3Class = findVersionedClass(classLoader, "vf0.i3");
+        Class<?> h3Class = findVersionedClass(classLoader, "vf0.h3");
         Constructor<?> paramsCtor = findConstructor(h3Class, String.class, u2Class, boolean.class, i3Class);
         Object params = paramsCtor.newInstance(wxid, element, false, null);
 
-        Class<?> serviceInterface = findClass(classLoader, "wf0.b2");
-        Method getService = findMethod(findClass(classLoader, "i95.n0"), "c", Class.class);
+        Class<?> serviceInterface = findVersionedClass(classLoader, "wf0.b2");
+        Method getService = findMethod(findVersionedClass(classLoader, "i95.n0"), "c", Class.class);
         Object videoService = getService.invoke(null, serviceInterface);
         if (videoService == null) {
             throw new IllegalStateException("wf0.b2 service is not available");
         }
-        Method buildTask = findMethod(videoService.getClass(), "bj", h3Class);
+        Method buildTask = findMethod(
+                videoService.getClass(),
+                symbols.featureServiceSendStack ? "wj" : "bj",
+                h3Class);
         Object task = buildTask.invoke(videoService, params);
         if (task == null) {
             throw new IllegalStateException("video task build returned null");
         }
 
-        Class<?> taskInterface = findClass(classLoader, "qi3.b0");
-        Class<?> dispatcherClass = findClass(classLoader, "qi3.x");
+        Class<?> taskInterface = findVersionedClass(classLoader, "qi3.b0");
+        Class<?> dispatcherClass = findVersionedClass(classLoader, "qi3.x");
         Object dispatcher = findField(dispatcherClass, "a").get(null);
         if (dispatcher == null) {
             throw new IllegalStateException("video task dispatcher is not available");
@@ -4936,10 +5017,11 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void sendViaVoiceSendTask(ClassLoader classLoader, String wxid, File voiceFile, int durationMs) throws Exception {
+        WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
         String voiceFileName = voiceFileNamePure(voiceFile);
         String preparedPath = prepareWeChatVoiceFile(classLoader, voiceFileName, voiceFile);
 
-        Class<?> paramsClass = findClass(classLoader, "cg0.d");
+        Class<?> paramsClass = findVersionedClass(classLoader, "cg0.d");
         Constructor<?> paramsCtor = findConstructor(paramsClass, String.class, String.class);
         Object params = paramsCtor.newInstance(wxid, voiceFileName);
         setOptionalIntField(params, Math.max(1000, durationMs), "h");
@@ -4949,23 +5031,26 @@ public final class HookEntry implements IXposedHookLoadPackage {
         Constructor<?> taskCtor = findConstructor(taskClass, paramsClass);
         Object task = taskCtor.newInstance(params);
 
-        Class<?> serviceInterface = findClass(classLoader, "dg0.f");
-        Object service = findMethod(findClass(classLoader, "i95.n0"), "c", Class.class).invoke(null, serviceInterface);
+        Class<?> serviceInterface = findVersionedClass(classLoader, "dg0.f");
+        Object service = findMethod(findVersionedClass(classLoader, "i95.n0"), "c", Class.class).invoke(null, serviceInterface);
         if (service == null) {
             throw new IllegalStateException("VoiceMsgFeatureService is not available");
         }
-        Class<?> taskInterface = findClass(classLoader, "qi3.b0");
-        Method send = findMethod(service.getClass(), "hj", taskInterface);
+        Class<?> taskInterface = findVersionedClass(classLoader, "qi3.b0");
+        Method send = findMethod(
+                service.getClass(),
+                symbols.featureServiceSendStack ? "yj" : "hj",
+                taskInterface);
         send.invoke(service, task);
         log("sendVoice invoked VoiceMsgSendTask fileName=" + voiceFileName + " path=" + preparedPath + " size=" + voiceFile.length());
     }
 
     private static void sendViaFileSendLogic(ClassLoader classLoader, String wxid, File file) throws Exception {
-        Class<?> paramsClass = findClass(classLoader, "ut.s0");
+        Class<?> paramsClass = findVersionedClass(classLoader, "ut.s0");
         Constructor<?> paramsCtor = findConstructor(paramsClass, String.class, String.class);
         Object params = paramsCtor.newInstance(wxid, file.getAbsolutePath());
 
-        Class<?> fileSendLogicHolder = findClass(classLoader, "dk5.w");
+        Class<?> fileSendLogicHolder = findVersionedClass(classLoader, "dk5.w");
         Object logic = findField(fileSendLogicHolder, "a").get(null);
         if (logic == null) {
             throw new IllegalStateException("FileSendLogic is not available");
@@ -4976,22 +5061,25 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void sendViaEmojiMgr(ClassLoader classLoader, String wxid, String emojiMd5) throws Exception {
+        WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
         Object emojiInfo = loadEmojiInfoByMd5(classLoader, emojiMd5);
         if (emojiInfo == null) {
             throw new IllegalStateException("emoji info was not found in local WeChat storage");
         }
         Class<?> featureClass = findClass(classLoader, "com.tencent.mm.feature.emoji.b0");
-        Object feature = findMethod(findClass(classLoader, "i95.n0"), "c", Class.class).invoke(null, featureClass);
+        Object feature = findMethod(findVersionedClass(classLoader, "i95.n0"), "c", Class.class).invoke(null, featureClass);
         if (feature == null) {
             throw new IllegalStateException("EmojiFeatureService is not available");
         }
-        Object emojiMgr = findNoArgMethod(feature.getClass(), "Ni").invoke(feature);
+        Object emojiMgr = findNoArgMethod(
+                feature.getClass(),
+                symbols.featureServiceSendStack ? "mj" : "Ni").invoke(feature);
         if (emojiMgr == null) {
             throw new IllegalStateException("EmojiMgrImpl is not available");
         }
         Class<?> emojiInfoClass = findClass(classLoader, "com.tencent.mm.storage.emotion.EmojiInfo");
-        Class<?> messageClass = findClass(classLoader, "com.tencent.mm.storage.f9");
-        Class<?> callbackClass = findClass(classLoader, "r15.b");
+        Class<?> messageClass = findVersionedClass(classLoader, "com.tencent.mm.storage.f9");
+        Class<?> callbackClass = findVersionedClass(classLoader, "r15.b");
         Method send = findMethod(emojiMgr.getClass(), "Y", String.class, emojiInfoClass, messageClass, callbackClass, int.class);
         send.invoke(emojiMgr, wxid, emojiInfoClass.cast(emojiInfo), null, null, emojiOrdinal(emojiInfo));
         log("sendEmoji invoked EmojiMgrImpl");
@@ -5104,6 +5192,19 @@ public final class HookEntry implements IXposedHookLoadPackage {
         if (isBlank(emojiMd5)) {
             return null;
         }
+        WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
+        if (symbols.featureServiceSendStack) {
+            Class<?> featureClass = findClass(classLoader, "com.tencent.mm.feature.emoji.b0");
+            Object feature = findMethod(findVersionedClass(classLoader, "i95.n0"), "c", Class.class)
+                    .invoke(null, featureClass);
+            if (feature == null) {
+                return null;
+            }
+            Object emojiMgr = findNoArgMethod(feature.getClass(), "mj").invoke(feature);
+            return emojiMgr == null
+                    ? null
+                    : findMethod(emojiMgr.getClass(), "y", String.class).invoke(emojiMgr, emojiMd5.trim());
+        }
         Object storageRoot = findNoArgMethod(findClass(classLoader, "com.tencent.mm.storage.n5"), "f").invoke(null);
         Object storage = findNoArgMethod(storageRoot.getClass(), "c").invoke(storageRoot);
         Object emojiInfo = findMethod(storage.getClass(), "u1", String.class).invoke(storage, emojiMd5.trim());
@@ -5111,7 +5212,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return emojiInfo;
         }
         try {
-            Object service = findMethod(findClass(classLoader, "i95.n0"), "c", Class.class)
+            Object service = findMethod(findVersionedClass(classLoader, "i95.n0"), "c", Class.class)
                     .invoke(null, findClass(classLoader, "k12.s"));
             if (service != null) {
                 Object repository = findNoArgMethod(service.getClass(), "Bi").invoke(service);
@@ -5144,7 +5245,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void sendViaLocationFeature(ClassLoader classLoader, String wxid, double latitude, double longitude, int scale, String label, String poiName, String infoURL, String poiID, boolean fromPoiList, String poiTips) throws Exception {
-        Class<?> paramsClass = findClass(classLoader, "y80.q1");
+        WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
+        Class<?> paramsClass = findVersionedClass(classLoader, "y80.q1");
         Constructor<?> paramsCtor = findConstructor(paramsClass, String.class);
         Object params = paramsCtor.newInstance(wxid);
         setDoubleFieldAny(params, latitude, "d");
@@ -5157,31 +5259,37 @@ public final class HookEntry implements IXposedHookLoadPackage {
         setBooleanFieldAny(params, fromPoiList, "k");
         setObjectField(params, poiTips == null ? "" : poiTips, "l");
 
-        Method getService = findMethod(findClass(classLoader, "i95.n0"), "c", Class.class);
-        Object service = getService.invoke(null, findClass(classLoader, "z80.h0"));
+        Method getService = findMethod(findVersionedClass(classLoader, "i95.n0"), "c", Class.class);
+        Object service = getService.invoke(null, findVersionedClass(classLoader, "z80.h0"));
         if (service == null) {
-            service = getService.invoke(null, findClass(classLoader, "y80.p0"));
+            service = getService.invoke(null, findVersionedClass(classLoader, "y80.p0"));
         }
         if (service == null) {
             throw new IllegalStateException("LocationMsgFeatureService is not available");
         }
-        Method buildTask = findMethod(service.getClass(), "Zi", paramsClass);
+        Method buildTask = findMethod(
+                service.getClass(),
+                symbols.featureServiceSendStack ? "tj" : "Zi",
+                paramsClass);
         Object task = buildTask.invoke(service, params);
         if (task == null) {
             throw new IllegalStateException("location task build returned null");
         }
-        Method send = findMethod(service.getClass(), "bj", findClass(classLoader, "qi3.b0"));
+        Method send = findMethod(
+                service.getClass(),
+                symbols.featureServiceSendStack ? "wj" : "bj",
+                findVersionedClass(classLoader, "qi3.b0"));
         send.invoke(service, task);
         log("sendLocation invoked LocationMsgSendTask scale=" + scale);
     }
 
     private static Object defaultVideoCrossParams(ClassLoader classLoader, Class<?> r2Class) throws Exception {
-        Class<?> f7Class = findClass(classLoader, "c01.f7");
-        Class<?> uf6Class = findClass(classLoader, "r45.uf6");
-        Class<?> xz6Class = findClass(classLoader, "r45.xz6");
-        Class<?> vh4Class = findClass(classLoader, "r45.vh4");
-        Class<?> p2Class = findClass(classLoader, "vf0.p2");
-        Class<?> r15dClass = findClass(classLoader, "r15.d");
+        Class<?> f7Class = findVersionedClass(classLoader, "c01.f7");
+        Class<?> uf6Class = findVersionedClass(classLoader, "r45.uf6");
+        Class<?> xz6Class = findVersionedClass(classLoader, "r45.xz6");
+        Class<?> vh4Class = findVersionedClass(classLoader, "r45.vh4");
+        Class<?> p2Class = findVersionedClass(classLoader, "vf0.p2");
+        Class<?> r15dClass = findVersionedClass(classLoader, "r15.d");
         Constructor<?> ctor = findConstructor(
                 r2Class,
                 f7Class,
@@ -6064,7 +6172,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static long sendViaNetScene(ClassLoader classLoader, String wxid, String text, int msgType) throws Exception {
-        Class<?> netSceneClass = findClass(classLoader, "w11.r0");
+        Class<?> netSceneClass = findVersionedClass(classLoader, "w11.r0");
         Constructor<?> ctor = findConstructor(netSceneClass, String.class, String.class, int.class, int.class, long.class);
         Object scene = ctor.newInstance(wxid, text, msgType, 4, 0L);
         long msgId = getLongField(scene, "f459357f", "f");
@@ -6100,7 +6208,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static boolean sendViaSendBuilder(ClassLoader classLoader, String wxid, String text, int msgType, Object forwardInfo) throws Exception {
         ensureSendBuilderFactory(classLoader);
-        Class<?> builderFactory = findClass(classLoader, "w11.s1");
+        Class<?> builderFactory = findVersionedClass(classLoader, "w11.s1");
         Method create = findMethod(builderFactory, "a", String.class);
         Object builder = create.invoke(null, wxid);
         if (builder == null) {
@@ -6127,12 +6235,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void ensureSendBuilderFactory(ClassLoader classLoader) throws Exception {
-        Class<?> builderFactory = findClass(classLoader, "w11.s1");
+        Class<?> builderFactory = findVersionedClass(classLoader, "w11.s1");
         Field factoryField = findFieldAny(builderFactory, "f459386a", "a");
         if (factoryField.get(null) != null) {
             return;
         }
-        Object factory = newInstanceAny(findClass(classLoader, "aq1.l"));
+        Object factory = newInstanceAny(findVersionedClass(classLoader, "aq1.l"));
         factoryField.set(null, factory);
         log("initialized w11.s1 send factory with aq1.l");
     }
@@ -6146,7 +6254,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static Object createForwardInfo(ClassLoader classLoader) throws Exception {
-        return findClass(classLoader, "c01.h7").getDeclaredConstructor().newInstance();
+        return findVersionedClass(classLoader, "c01.h7").getDeclaredConstructor().newInstance();
     }
 
     private static void applyForwardInfo(Object builder, Object forwardInfo) throws Exception {
@@ -6155,7 +6263,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static int resolveMessageType(ClassLoader classLoader, String wxid) {
         try {
-            Class<?> typeResolver = findClass(classLoader, "c01.e2");
+            Class<?> typeResolver = findVersionedClass(classLoader, "c01.e2");
             Object result = findMethod(typeResolver, "C", String.class).invoke(null, wxid);
             if (result instanceof Number) {
                 int value = ((Number) result).intValue();

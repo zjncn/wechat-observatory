@@ -6,7 +6,8 @@ It runs inside WeChat through LSPosed and posts message DB insert events to the
 gateway. The gateway stores WeChat events and queues admin-created send actions
 for the module to receive and send from inside the WeChat process.
 
-The current public compatibility target is WeChat for Android `8.0.75`.
+The current public compatibility targets are WeChat for Android `8.0.75` and
+`8.0.76`.
 WeChat internals change between releases; validate message observation, contact
 sync, media upload, and Action Outbox sends after upgrading WeChat.
 
@@ -127,8 +128,9 @@ registration, contact sync, and inbound message polling fallback alive while
 the outbox socket is connected.
 
 The send adapter is intentionally isolated behind Action Outbox dispatch in
-`HookEntry`. Text still uses the lower-level builder path on WeChat Android
-`8.0.75`:
+`HookEntry`. Text uses the lower-level builder path on supported WeChat Android
+versions. The compatibility layer maps the `8.0.75` symbols below to their
+`8.0.76` equivalents at runtime:
 
 ```text
 w11.s1.a(toUser) -> w11.r1.g/e/h(...) -> w11.r1.a().a()
@@ -140,13 +142,18 @@ WeChat's service-locator initialization guard from the module worker thread, so
 the builder is the safer primary path. Both paths are WeChat-process calls; the
 module does not parse or execute commands.
 
+WeChat `8.0.76` also moved image, voice, video, file, emoji, location, and app
+message sends to new FeatureService symbols. `WeChatVersionSymbols` keeps those
+aliases behind one runtime-selected profile instead of scattering version
+checks through Action Outbox dispatch.
+
 Action Outbox v1 dispatches `text`, `image`, `video`, `voice`, `file`, `emoji`,
 `location`, `quote`, `link`, `mini_program`, and `chat_history` from the gateway
 queue. Unsupported or malformed kinds must ACK `failed` instead of being
 silently skipped. Payment-like and system-only message types are observation
 boundaries, not send actions.
 
-On WeChat Android `8.0.75`, the installed app can run through Tinker. The send
+On supported WeChat Android builds, the installed app can run through Tinker. The send
 adapter must resolve WeChat classes with the patched runtime loader returned by
 `Application.getClassLoader()`, which can be a `DelegateLastClassLoader` over
 `/data/user/0/com.tencent.mm/tinker/.../tinker_classN.apk`. Using the base

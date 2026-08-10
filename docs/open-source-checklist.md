@@ -8,7 +8,7 @@
 - [ ] 修改所有真实密码、API Key、IP、域名、手机号、wxid。
 - [ ] 确认 `.env`、真实 k3s secret、真实 Docker env 没有提交。
 - [ ] 确认 README 可以让新用户跑起服务端、Web 和 Android 模块。
-- [ ] 确认 README 标注当前适配微信 Android `8.0.75`。
+- [ ] 确认 README 标注当前适配微信 Android `8.0.75`、`8.0.76`。
 - [ ] 建议补充 Gradle Wrapper，方便用户命令行构建 Android 模块。
 - [ ] 确认文档说明 Root、LSPosed、微信 Hook 和账号风险。
 - [ ] 确认仓库不包含真实聊天截图、真实日志、真实数据库导出。
