@@ -93,7 +93,8 @@ func TestPublicV1CapabilitiesDescribeProtocolWithoutSecrets(t *testing.T) {
 		}
 	}
 
-	var payment *PublicMessageCapability
+	var transfer *PublicMessageCapability
+	var redPacket *PublicMessageCapability
 	var text *PublicMessageCapability
 	var voice *PublicMessageCapability
 	var emoji *PublicMessageCapability
@@ -101,8 +102,11 @@ func TestPublicV1CapabilitiesDescribeProtocolWithoutSecrets(t *testing.T) {
 	var revoke *PublicMessageCapability
 	for i := range got.Capabilities {
 		capability := &got.Capabilities[i]
-		if capability.Kind == MessageKindPayment {
-			payment = capability
+		if capability.Kind == MessageKindPayment && capability.Subtype == "transfer" {
+			transfer = capability
+		}
+		if capability.Kind == MessageKindPayment && capability.Subtype == "red_packet" {
+			redPacket = capability
 		}
 		if capability.Kind == MessageKindText {
 			text = capability
@@ -135,11 +139,11 @@ func TestPublicV1CapabilitiesDescribeProtocolWithoutSecrets(t *testing.T) {
 	if revoke == nil || revoke.SendEndpoint != "/api/v1/messages/revoke" || revoke.OutboundStatus != "experimental" {
 		t.Fatalf("revoke capability should be exposed as experimental support: %+v", revoke)
 	}
-	if payment == nil || payment.InboundStatus != "parse_only" || payment.OutboundStatus != "unsupported" {
-		t.Fatalf("payment capability should be parse-only inbound: %+v", payment)
+	if transfer == nil || transfer.InboundStatus != "structured" || transfer.OutboundStatus != "experimental" || transfer.SendEndpoint != "/api/v1/transfers/accept" {
+		t.Fatalf("transfer capability should expose structured accept support: %+v", transfer)
 	}
-	if !containsString(payment.Unsupported, "payment_sensitive_fields_redacted") {
-		t.Fatalf("payment redaction marker missing: %+v", payment.Unsupported)
+	if redPacket == nil || !containsString(redPacket.Unsupported, "red_packet_sensitive_fields_redacted") {
+		t.Fatalf("red packet redaction marker missing: %+v", redPacket)
 	}
 }
 
@@ -202,6 +206,28 @@ func TestPublicV1TypedMessageEndpointsUseActionOutbox(t *testing.T) {
 	}
 }
 
+func TestPublicV1TransferAcceptQueuesSourceBoundAction(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+	body := []byte(`{"device":"phone-a","owner_wxid":"wxid_self","chat_record_id":12345}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/transfers/accept", bytes.NewReader(body))
+	req.Header.Set("X-Bridge-Password", "admin")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected transfer accept status %d body=%s", rec.Code, rec.Body.String())
+	}
+	items := pollOutbox(t, service, "phone-a", 10)
+	if len(items) != 1 || items[0].Kind != OutboxKindTransferAccept || items[0].WxID != "" {
+		t.Fatalf("unexpected transfer accept outbox item: %+v", items)
+	}
+	if !bytes.Contains(items[0].PayloadJSON, []byte(`"chat_record_id":12345`)) {
+		t.Fatalf("transfer source id missing from payload: %s", items[0].PayloadJSON)
+	}
+}
+
 func TestPublicV1GenericActionEndpointReturnsFirstOutboxAndWarning(t *testing.T) {
 	service := newTestService("", WithMediaDir(t.TempDir()))
 	server := NewHTTPServer(service, "admin").Handler()
@@ -238,12 +264,11 @@ func TestPublicV1GenericActionEndpointReturnsFirstOutboxAndWarning(t *testing.T)
 	}
 
 	targets := map[string]bool{}
-	for attempt := 0; attempt < 2; attempt++ {
-		items := pollOutbox(t, service, "phone-a", 10)
-		if len(items) != 1 {
-			t.Fatalf("module polling should expose one queued target at a time: %+v", items)
-		}
-		item := items[0]
+	items := pollOutbox(t, service, "phone-a", 10)
+	if len(items) != 2 {
+		t.Fatalf("lane-aware module polling should expose both independent targets: %+v", items)
+	}
+	for attempt, item := range items {
 		if item.Kind != OutboxKindText || item.OwnerWxID != "wxid_self" || item.Text != "fanout through v1 action" {
 			t.Fatalf("unexpected queued action item: %+v", item)
 		}
@@ -1262,7 +1287,7 @@ func TestOpenAPIDocsArePublicAndDescribeActionProtocol(t *testing.T) {
 	if !ok {
 		t.Fatalf("openapi paths missing: %+v", spec)
 	}
-	for _, path := range []string{"/api/v1/capabilities", "/api/v1/messages/text", "/api/v1/messages/image", "/api/v1/messages/link", "/api/v1/messages/revoke", "/api/v1/messages/chat-history", "/api/v1/outbox/{id}", "/api/v1/ws", "/api/send/action", "/module/outbox/poll", "/module/outbox/ack", "/webhook/module/message"} {
+	for _, path := range []string{"/api/v1/capabilities", "/api/v1/messages/text", "/api/v1/messages/image", "/api/v1/messages/link", "/api/v1/messages/revoke", "/api/v1/transfers/accept", "/api/v1/messages/chat-history", "/api/v1/outbox/{id}", "/api/v1/ws", "/api/send/action", "/module/outbox/poll", "/module/outbox/ack", "/webhook/module/message"} {
 		if _, ok := paths[path]; !ok {
 			t.Fatalf("openapi path %s missing", path)
 		}

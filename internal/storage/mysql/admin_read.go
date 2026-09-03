@@ -54,7 +54,7 @@ func (s *Store) ListStoredEvents(ctx context.Context, limit int) ([]bridge.Store
 			ev.direction, ev.from_wxid, ev.to_wxid, ev.room_id, ev.sender_wxid, ev.text,
 			ev.message_type, ev.message_kind, ev.appmsg_type, ev.appmsg_subtype,
 			ev.appmsg_title, ev.appmsg_description, ev.appmsg_url, ev.appmsg_file_name,
-			ev.appmsg_app_name, ev.unsupported, ev.evidence,
+			ev.appmsg_app_name, ev.unsupported, ev.evidence, ev.payment,
 			ev.location_latitude, ev.location_longitude, ev.location_scale, ev.location_label,
 			ev.location_poiname, ev.location_info_url, ev.location_poi_id,
 			ev.location_from_poi_list, ev.location_poi_category_tips,
@@ -139,7 +139,7 @@ func listMessagesQuery(filter bridge.MessageFilter) (string, []any) {
 			ev.direction, ev.from_wxid, ev.to_wxid, ev.room_id, ev.sender_wxid, ev.text,
 			ev.message_type, ev.message_kind, ev.appmsg_type, ev.appmsg_subtype,
 			ev.appmsg_title, ev.appmsg_description, ev.appmsg_url, ev.appmsg_file_name,
-			ev.appmsg_app_name, ev.unsupported, ev.evidence,
+			ev.appmsg_app_name, ev.unsupported, ev.evidence, ev.payment,
 			ev.location_latitude, ev.location_longitude, ev.location_scale, ev.location_label,
 			ev.location_poiname, ev.location_info_url, ev.location_poi_id,
 			ev.location_from_poi_list, ev.location_poi_category_tips,
@@ -176,7 +176,7 @@ func scanStoredEventViews(rows *sql.Rows) ([]bridge.StoredEventView, error) {
 		var item bridge.StoredEventView
 		var sourceID, ownerWxID, fromWxID, toWxID, roomID, senderWxID, rawProvider sql.NullString
 		var messageKind, appMsgSubtype, appMsgTitle, appMsgDescription, appMsgURL, appMsgFileName, appMsgAppName sql.NullString
-		var unsupportedJSON, evidenceJSON sql.NullString
+		var unsupportedJSON, evidenceJSON, paymentJSON sql.NullString
 		var locationLabel, locationPoiName, locationInfoURL, locationPoiID, locationPoiTips sql.NullString
 		var locationLatitude, locationLongitude sql.NullFloat64
 		var locationScale sql.NullInt64
@@ -210,6 +210,7 @@ func scanStoredEventViews(rows *sql.Rows) ([]bridge.StoredEventView, error) {
 			&appMsgAppName,
 			&unsupportedJSON,
 			&evidenceJSON,
+			&paymentJSON,
 			&locationLatitude,
 			&locationLongitude,
 			&locationScale,
@@ -252,6 +253,7 @@ func scanStoredEventViews(rows *sql.Rows) ([]bridge.StoredEventView, error) {
 		item.AppMsgAppName = appMsgAppName.String
 		item.Unsupported = decodeStringSliceJSON(unsupportedJSON.String)
 		item.Evidence = decodeStringSliceJSON(evidenceJSON.String)
+		item.Payment = decodePaymentJSON(paymentJSON.String)
 		if locationLatitude.Valid {
 			value := locationLatitude.Float64
 			item.LocationLatitude = &value
@@ -544,6 +546,17 @@ func decodeStringSliceJSON(value string) []string {
 		return nil
 	}
 	return cleaned
+}
+
+func decodePaymentJSON(value string) *bridge.PaymentInfo {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	var payment bridge.PaymentInfo
+	if err := json.Unmarshal([]byte(value), &payment); err != nil {
+		return nil
+	}
+	return &payment
 }
 
 func firstNonEmptyContactLabel(values ...string) string {

@@ -25,65 +25,87 @@ const (
 
 	RawProviderModuleAck = "module_ack"
 
-	OutboxKindText     = "text"
-	OutboxKindImage    = "image"
-	OutboxKindVideo    = "video"
-	OutboxKindVoice    = "voice"
-	OutboxKindFile     = "file"
-	OutboxKindEmoji    = "emoji"
-	OutboxKindLocation = "location"
-	OutboxKindQuote    = "quote"
-	OutboxKindLink     = "link"
-	OutboxKindRevoke   = "revoke"
+	OutboxKindText           = "text"
+	OutboxKindImage          = "image"
+	OutboxKindVideo          = "video"
+	OutboxKindVoice          = "voice"
+	OutboxKindFile           = "file"
+	OutboxKindEmoji          = "emoji"
+	OutboxKindLocation       = "location"
+	OutboxKindQuote          = "quote"
+	OutboxKindLink           = "link"
+	OutboxKindRevoke         = "revoke"
+	OutboxKindTransferAccept = "transfer_accept"
 
 	OutboxKindChatHistory = "chat_history"
 	OutboxKindMiniProgram = "mini_program"
 )
 
+// PaymentInfo contains the stable, non-secret fields extracted from a payment
+// message. AmountMinor uses the currency's minor unit (for example, fen for CNY).
+type PaymentInfo struct {
+	Type          string `json:"type,omitempty"`
+	State         string `json:"state,omitempty"`
+	AmountMinor   int64  `json:"amount_minor,omitempty"`
+	Currency      string `json:"currency,omitempty"`
+	DisplayAmount string `json:"display_amount,omitempty"`
+	TransactionID string `json:"transaction_id,omitempty"`
+	TransferID    string `json:"transfer_id,omitempty"`
+	Memo          string `json:"memo,omitempty"`
+	PayerWxID     string `json:"payer_wxid,omitempty"`
+	ReceiverWxID  string `json:"receiver_wxid,omitempty"`
+	InvalidTime   int    `json:"invalid_time,omitempty"`
+	EffectiveDate int    `json:"effective_date,omitempty"`
+	ReceiveStatus int    `json:"receive_status,omitempty"`
+	PaySubtype    int    `json:"pay_subtype,omitempty"`
+}
+
 type MessageEvent struct {
-	APIKey              string    `json:"api_key,omitempty"`
-	ID                  string    `json:"id"`
-	EventID             int64     `json:"event_id"`
-	ChatRecordID        int64     `json:"chat_record_id"`
-	Device              string    `json:"device"`
-	OwnerWxID           string    `json:"owner_wxid,omitempty"`
-	MessageKind         string    `json:"kind,omitempty"`
-	From                string    `json:"from"`
-	To                  string    `json:"to"`
-	RoomID              string    `json:"room_id"`
-	Sender              string    `json:"sender"`
-	Text                string    `json:"text"`
-	MessageType         int32     `json:"message_type"`
-	RawXML              string    `json:"raw_xml,omitempty"`
-	AppMsgType          int32     `json:"appmsg_type,omitempty"`
-	AppMsgSubtype       string    `json:"appmsg_subtype,omitempty"`
-	AppMsgTitle         string    `json:"appmsg_title,omitempty"`
-	AppMsgDescription   string    `json:"appmsg_description,omitempty"`
-	AppMsgURL           string    `json:"appmsg_url,omitempty"`
-	AppMsgFileName      string    `json:"appmsg_file_name,omitempty"`
-	AppMsgAppName       string    `json:"appmsg_app_name,omitempty"`
-	Unsupported         []string  `json:"unsupported,omitempty"`
-	Evidence            []string  `json:"evidence,omitempty"`
-	LocationLatitude    *float64  `json:"location_latitude,omitempty"`
-	LocationLongitude   *float64  `json:"location_longitude,omitempty"`
-	LocationScale       int       `json:"location_scale,omitempty"`
-	LocationLabel       string    `json:"location_label,omitempty"`
-	LocationPoiName     string    `json:"location_poiname,omitempty"`
-	LocationInfoURL     string    `json:"location_info_url,omitempty"`
-	LocationPoiID       string    `json:"location_poi_id,omitempty"`
-	LocationFromPoiList bool      `json:"location_from_poi_list,omitempty"`
-	LocationPoiTips     string    `json:"location_poi_category_tips,omitempty"`
-	MediaKind           string    `json:"media_kind,omitempty"`
-	MediaMime           string    `json:"media_mime,omitempty"`
-	MediaName           string    `json:"media_name,omitempty"`
-	MediaURL            string    `json:"media_url,omitempty"`
-	MediaSize           int64     `json:"media_size,omitempty"`
-	MediaBase64         string    `json:"media_base64,omitempty"`
-	CreateTime          int64     `json:"create_time"`
-	Direction           Direction `json:"direction"`
-	RawProvider         string    `json:"raw_provider"`
-	ChatKind            ChatKind  `json:"chat_kind,omitempty"`
-	Conversation        string    `json:"chat_id,omitempty"`
+	APIKey              string       `json:"api_key,omitempty"`
+	ID                  string       `json:"id"`
+	EventID             int64        `json:"event_id"`
+	ChatRecordID        int64        `json:"chat_record_id"`
+	Device              string       `json:"device"`
+	OwnerWxID           string       `json:"owner_wxid,omitempty"`
+	MessageKind         string       `json:"kind,omitempty"`
+	From                string       `json:"from"`
+	To                  string       `json:"to"`
+	RoomID              string       `json:"room_id"`
+	Sender              string       `json:"sender"`
+	Text                string       `json:"text"`
+	AtSelf              bool         `json:"at_self,omitempty"`
+	MessageType         int32        `json:"message_type"`
+	RawXML              string       `json:"raw_xml,omitempty"`
+	AppMsgType          int32        `json:"appmsg_type,omitempty"`
+	AppMsgSubtype       string       `json:"appmsg_subtype,omitempty"`
+	AppMsgTitle         string       `json:"appmsg_title,omitempty"`
+	AppMsgDescription   string       `json:"appmsg_description,omitempty"`
+	AppMsgURL           string       `json:"appmsg_url,omitempty"`
+	AppMsgFileName      string       `json:"appmsg_file_name,omitempty"`
+	AppMsgAppName       string       `json:"appmsg_app_name,omitempty"`
+	Unsupported         []string     `json:"unsupported,omitempty"`
+	Evidence            []string     `json:"evidence,omitempty"`
+	Payment             *PaymentInfo `json:"payment,omitempty"`
+	LocationLatitude    *float64     `json:"location_latitude,omitempty"`
+	LocationLongitude   *float64     `json:"location_longitude,omitempty"`
+	LocationScale       int          `json:"location_scale,omitempty"`
+	LocationLabel       string       `json:"location_label,omitempty"`
+	LocationPoiName     string       `json:"location_poiname,omitempty"`
+	LocationInfoURL     string       `json:"location_info_url,omitempty"`
+	LocationPoiID       string       `json:"location_poi_id,omitempty"`
+	LocationFromPoiList bool         `json:"location_from_poi_list,omitempty"`
+	LocationPoiTips     string       `json:"location_poi_category_tips,omitempty"`
+	MediaKind           string       `json:"media_kind,omitempty"`
+	MediaMime           string       `json:"media_mime,omitempty"`
+	MediaName           string       `json:"media_name,omitempty"`
+	MediaURL            string       `json:"media_url,omitempty"`
+	MediaSize           int64        `json:"media_size,omitempty"`
+	MediaBase64         string       `json:"media_base64,omitempty"`
+	CreateTime          int64        `json:"create_time"`
+	Direction           Direction    `json:"direction"`
+	RawProvider         string       `json:"raw_provider"`
+	ChatKind            ChatKind     `json:"chat_kind,omitempty"`
+	Conversation        string       `json:"chat_id,omitempty"`
 }
 
 func (e MessageEvent) Validate() error {
@@ -137,6 +159,9 @@ func (e MessageEvent) Normalize() MessageEvent {
 	}
 	if e.ChatKind == ChatKindRoom && strings.TrimSpace(e.RoomID) == "" {
 		e.RoomID = e.ChatID()
+	}
+	if e.AtSelf && e.Direction == DirectionRecv && e.ChatKind == ChatKindRoom {
+		e.Evidence = appendUnique(e.Evidence, "msg_source.at_self")
 	}
 	e = normalizeMessageEnvelope(e)
 	return e
@@ -241,12 +266,16 @@ func (req SendActionRequest) Validate(defaultDevice string) (SendActionRequest, 
 	if req.Device == "" {
 		return req, errors.New("device is required")
 	}
-	if len(req.WxIDs) == 0 {
+	if req.Kind == OutboxKindTransferAccept && len(req.WxIDs) == 0 {
+		// The Android module resolves the conversation and sender from the exact
+		// local source message, so callers cannot substitute a mismatched wxid.
+		req.WxIDs = []string{""}
+	} else if len(req.WxIDs) == 0 {
 		return req, errors.New("wx_ids is required")
 	}
 	for i := range req.WxIDs {
 		req.WxIDs[i] = strings.TrimSpace(req.WxIDs[i])
-		if req.WxIDs[i] == "" {
+		if req.WxIDs[i] == "" && req.Kind != OutboxKindTransferAccept {
 			return req, errors.New("wx_ids cannot contain empty values")
 		}
 	}
@@ -362,6 +391,14 @@ func (req SendActionRequest) Validate(defaultDevice string) (SendActionRequest, 
 		if req.Text == "" {
 			req.Text = "[撤回]"
 		}
+	case OutboxKindTransferAccept:
+		if req.ChatRecordID <= 0 {
+			return req, errors.New("chat_record_id is required")
+		}
+		req.SourceChatRecordID = req.ChatRecordID
+		if req.Text == "" {
+			req.Text = "[收款]"
+		}
 	case OutboxKindLink:
 		if req.SourceChatRecordID <= 0 {
 			if req.AppMsgTitle == "" {
@@ -439,7 +476,7 @@ func (req SendActionRequest) Validate(defaultDevice string) (SendActionRequest, 
 			}
 		}
 	default:
-		return req, errors.New("kind must be text, image, video, voice, file, emoji, location, quote, link, mini_program, chat_history, or revoke")
+		return req, errors.New("kind must be text, image, video, voice, file, emoji, location, quote, link, mini_program, chat_history, revoke, or transfer_accept")
 	}
 	return req, nil
 }

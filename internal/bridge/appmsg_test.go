@@ -305,7 +305,7 @@ func TestNormalizeAppMsgChatHistoryUnknownRecordItemTypeIsExplicit(t *testing.T)
 	}
 }
 
-func TestNormalizePaymentMessageTypesAreParseOnly(t *testing.T) {
+func TestNormalizePaymentMessageTypesAreClassifiedSafely(t *testing.T) {
 	cases := []struct {
 		name        string
 		messageType int32
@@ -333,8 +333,11 @@ func TestNormalizePaymentMessageTypesAreParseOnly(t *testing.T) {
 			if event.Text != tc.wantText || event.RawXML != "" || event.AppMsgTitle != "" || event.AppMsgDescription != "" || event.AppMsgURL != "" {
 				t.Fatalf("direct payment type should be redacted: %+v", event)
 			}
-			if !containsString(event.Unsupported, "payment_outbound_unsupported") || !containsString(event.Unsupported, "payment_sensitive_fields_redacted") {
-				t.Fatalf("direct payment unsupported markers missing: %+v", event.Unsupported)
+			if tc.wantSubtype == "transfer" && !containsString(event.Unsupported, "transfer_fields_missing") {
+				t.Fatalf("missing transfer fields should be explicit: %+v", event.Unsupported)
+			}
+			if tc.wantSubtype == "red_packet" && !containsString(event.Unsupported, "red_packet_outbound_unsupported") {
+				t.Fatalf("red packet limitation should be explicit: %+v", event.Unsupported)
 			}
 			if !containsString(event.Evidence, "message.type="+strconv.FormatInt(int64(tc.messageType), 10)) || !containsString(event.Evidence, "payment.message_type."+tc.wantSubtype) {
 				t.Fatalf("direct payment evidence missing: %+v", event.Evidence)
@@ -380,13 +383,56 @@ func TestNormalizeAppMsgPaymentRedactsSensitiveFields(t *testing.T) {
 			if event.AppMsgTitle != "" || event.AppMsgDescription != "" || event.AppMsgURL != "" || event.AppMsgFileName != "" || event.AppMsgAppName != "" {
 				t.Fatalf("payment fields should be redacted: %+v", event)
 			}
-			if !containsString(event.Unsupported, "payment_outbound_unsupported") || !containsString(event.Unsupported, "payment_sensitive_fields_redacted") {
-				t.Fatalf("payment unsupported markers missing: %+v", event.Unsupported)
+			if tc.wantSubtype == "transfer" && !containsString(event.Unsupported, "transfer_fields_missing") {
+				t.Fatalf("partial transfer marker missing: %+v", event.Unsupported)
 			}
-			if !containsString(event.Evidence, "payment.parse_only") || !containsString(event.Evidence, "raw_xml.appmsg.type="+strconv.FormatInt(int64(tc.appMsgType), 10)) {
+			if tc.wantSubtype == "red_packet" && !containsString(event.Unsupported, "red_packet_sensitive_fields_redacted") {
+				t.Fatalf("red packet redaction marker missing: %+v", event.Unsupported)
+			}
+			if !containsString(event.Evidence, "raw_xml.appmsg.type="+strconv.FormatInt(int64(tc.appMsgType), 10)) {
 				t.Fatalf("payment evidence missing: %+v", event.Evidence)
 			}
 		})
+	}
+}
+
+func TestNormalizeTransferExposesStructuredAmountAndState(t *testing.T) {
+	event := MessageEvent{
+		MessageType: MessageTypeTransfer,
+		RawXML: `<msg><appmsg><type>2000</type><wcpayinfo>
+			<paysubtype>1</paysubtype><feedesc>￥12.34</feedesc>
+			<transcationid>transaction-1</transcationid><transferid>transfer-1</transferid>
+			<invalidtime>86400</invalidtime><effectivedate>1</effectivedate>
+			<total_fee>1234</total_fee><fee_type>CNY</fee_type><pay_memo>晚饭</pay_memo>
+			<payer_username>wxid_payer</payer_username><receiver_username>wxid_receiver</receiver_username>
+		</wcpayinfo></appmsg></msg>`,
+	}.Normalize()
+
+	if event.Payment == nil {
+		t.Fatalf("structured transfer payment is missing: %+v", event)
+	}
+	if event.Payment.AmountMinor != 1234 || event.Payment.Currency != "CNY" || event.Payment.State != "pending" {
+		t.Fatalf("unexpected transfer amount/state: %+v", event.Payment)
+	}
+	if event.Payment.TransactionID != "transaction-1" || event.Payment.TransferID != "transfer-1" {
+		t.Fatalf("unexpected transfer identifiers: %+v", event.Payment)
+	}
+	if event.RawXML != "" || !containsString(event.Evidence, "payment.transfer.structured") {
+		t.Fatalf("transfer must clear raw XML and retain structured evidence: %+v", event)
+	}
+}
+
+func TestNormalizeTransferDerivesCNYAmountFromFeedDescription(t *testing.T) {
+	event := MessageEvent{
+		MessageType: MessageTypeTransfer,
+		RawXML: `<msg><appmsg><type>2000</type><wcpayinfo>
+			<paysubtype>1</paysubtype><feedesc>￥1,234.56</feedesc>
+			<transcationid>transaction-1</transcationid><transferid>transfer-1</transferid>
+		</wcpayinfo></appmsg></msg>`,
+	}.Normalize()
+
+	if event.Payment == nil || event.Payment.AmountMinor != 123456 || event.Payment.Currency != "CNY" {
+		t.Fatalf("unexpected display-derived transfer amount: %+v", event.Payment)
 	}
 }
 

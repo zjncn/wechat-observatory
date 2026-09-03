@@ -1,6 +1,6 @@
 /*
  * @input LSPosed/Xposed hook callbacks, BridgeConfig, WeChat runtime classes, HTTP/WebSocket transport
- * @output Message observation uploads, contact snapshots, and Action Outbox send execution inside WeChat
+ * @output Message observation uploads, contact snapshots, Action Outbox sends, and source-bound transfer acceptance
  * @position Central Android module runtime that bridges WeChat internals with the gateway service
  * @auto-doc Update header and folder INDEX.md when this file changes
  */
@@ -29,9 +29,12 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Member;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.lang.reflect.Proxy;
 import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -41,14 +44,18 @@ import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -66,6 +73,7 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
+import static cc.wechat.observatory.util.Strings.fullErrorChain;
 import static cc.wechat.observatory.util.Strings.isBlank;
 import static cc.wechat.observatory.util.Strings.json;
 import static cc.wechat.observatory.util.Strings.shortError;
@@ -76,6 +84,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final int MESSAGE_TYPE_QUOTE = 822083633;
     private static final int MESSAGE_TYPE_APPMSG = 49;
     private static final int MESSAGE_TYPE_FILE_TRANSFER = 1090519089;
+    private static final int MESSAGE_TYPE_TRANSFER = 419430449;
+    private static final int MESSAGE_TYPE_RED_PACKET = 436207665;
     private static final int APPMSG_TYPE_LINK = 5;
     private static final int APPMSG_TYPE_FILE = 6;
     private static final int APPMSG_TYPE_CHAT_HISTORY = 19;
@@ -83,10 +93,26 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final int APPMSG_TYPE_MINI_PROGRAM_LEGACY = 36;
     private static final int APPMSG_TYPE_QUOTE = 57;
     private static final int MAX_CHAT_HISTORY_SOURCE_ITEMS = 50;
+    private static final int TRANSFER_STARTUP_BACKFILL_LIMIT = 200;
+    private static final long TRANSFER_STARTUP_BACKFILL_WINDOW_SECONDS = 24L * 60L * 60L;
     private static final long OUTBOX_MEDIA_DOWNLOAD_LIMIT_BYTES = 50L * 1024L * 1024L;
     private static final AtomicBoolean WORKER_STARTED = new AtomicBoolean(false);
     private static final AtomicBoolean OUTBOX_WORKER_STARTED = new AtomicBoolean(false);
     private static final AtomicBoolean EXTERNAL_STORAGE_FALLBACK_HOOKED = new AtomicBoolean(false);
+    private static final AtomicBoolean TRANSFER_CONFIRM_CALLBACK_HOOKED = new AtomicBoolean(false);
+    private static final AtomicBoolean TRANSFER_QUERY_CALLBACK_HOOKED = new AtomicBoolean(false);
+    private static final AtomicBoolean WALLET_PLUGIN_INITIALIZED = new AtomicBoolean(false);
+    private static final AtomicBoolean WALLET_CLASSLOADERS_LOGGED = new AtomicBoolean(false);
+    private static final AtomicBoolean TENPAY_SIGN_FALLBACK_HOOKED = new AtomicBoolean(false);
+    private static final AtomicBoolean TENPAY_SIGN_FALLBACK_USED = new AtomicBoolean(false);
+    private static final AtomicBoolean TENPAY_SIGN_FALLBACK_TRANSFER_USED = new AtomicBoolean(false);
+    private static final AtomicBoolean TENPAY_SIGN_FALLBACK_SELF_TESTED = new AtomicBoolean(false);
+    private static final AtomicBoolean TENPAY_TRANSFER_SCENE_SELF_TESTED = new AtomicBoolean(false);
+    private static final AtomicBoolean TENPAY_CALLERS_DEOPTIMIZED = new AtomicBoolean(false);
+    private static final ThreadLocal<Boolean> TENPAY_SIGN_FALLBACK_ACTIVE = new ThreadLocal<>();
+    private static final ThreadLocal<Boolean> TENPAY_SIGN_FALLBACK_TRANSFER_ACTIVE = new ThreadLocal<>();
+    private static final ConcurrentHashMap<Object, NetworkResultWaiter> TRANSFER_CONFIRM_WAITERS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<Object, NetworkResultWaiter> TRANSFER_QUERY_WAITERS = new ConcurrentHashMap<>();
     private static final ExecutorService POST_EXECUTOR = Executors.newFixedThreadPool(4, new ThreadFactory() {
         @Override
         public Thread newThread(Runnable runnable) {
@@ -103,6 +129,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile long LAST_CONTACT_SCAN_LOG_AT = 0L;
     private static volatile long LAST_MESSAGE_POLL_AT = 0L;
     private static volatile long LAST_MESSAGE_ID = 0L;
+    private static volatile boolean TRANSFER_STARTUP_BACKFILL_DONE = false;
     private static volatile boolean MESSAGE_WATERMARK_READY = false;
     private static volatile int MESSAGE_POLL_CONSECUTIVE_FAILS = 0;
     private static volatile long MESSAGE_POLL_BACKOFF_UNTIL = 0L;
@@ -111,6 +138,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final long[] MEDIA_RETRY_DELAYS_MS = new long[]{3000L, 10000L, 30000L, 120000L};
     private static final Set<Long> MEDIA_RETRY_SCHEDULED_IDS = new HashSet<>();
     private static final Set<Long> MEDIA_UPLOAD_REPORTED_IDS = new HashSet<>();
+    private static final Set<Long> ORIGINAL_IMAGE_DOWNLOAD_DISPATCHED_IDS = new HashSet<>();
+    private static final Map<Long, String> ORIGINAL_IMAGE_DOWNLOADED_PATHS = new LinkedHashMap<>();
+    private static final Set<Long> ORIGINAL_IMAGE_DIAGNOSTIC_REPORTED_IDS = new HashSet<>();
     private static final Set<String> EMOJI_INFO_DIAGNOSTIC_REPORTED_MD5 = new HashSet<>();
     private static volatile long LAST_MEDIA_RETRY_FAIL_LOG_AT = 0L;
     private static volatile long LAST_WEBSOCKET_FAIL_LOG_AT = 0L;
@@ -158,10 +188,17 @@ public final class HookEntry implements IXposedHookLoadPackage {
         String msgSource;
     }
 
-    private static final class RecentMediaCandidate {
-        File file;
-        long distanceMs = Long.MAX_VALUE;
-        long modifiedMs = 0L;
+    private static final class ImageInfoRecord {
+        long id;
+        long hdId;
+        String bigPath = "";
+        String midPath = "";
+        int totalLen;
+        int offset;
+
+        boolean isComplete() {
+            return totalLen > 0 && offset >= totalLen;
+        }
     }
 
     private static final class OutboxDispatchItem {
@@ -421,6 +458,614 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return value.substring(0, maxLength) + "...";
     }
 
+    /**
+     * Sets com.tencent.mm.sdk.platformtools.x2.a (WeChat's own MMApplicationContext
+     * holder) as early as physically possible in the process lifecycle, if it isn't
+     * set already. Root cause per handoff doc 13.26/13.27: on some devices WeChat's
+     * own code doesn't set this field before something (WeChat itself, or one of our
+     * other hooks) first touches com.tencent.mm.wallet_core.tenpay.model.o, whose
+     * static init reads x2.a and NPEs if it's null — permanently marking o (and
+     * transfer's n0/h1) erroneous for the rest of the process, no matter how the
+     * field gets fixed afterward. Calling this from confirmTransfer/queryTransferStatus
+     * alone was too late (13.27 retest still failed); wiring it into every
+     * Application.attach/onBaseContextAttached/onCreate hook callback instead gives
+     * it the earliest possible chance, before any wallet class gets touched. Cheap
+     * and idempotent (a single field read) once x2.a is already set.
+     */
+    private static void ensureAppContextField(Context context, ClassLoader classLoader) {
+        if (context == null || classLoader == null) {
+            return;
+        }
+        try {
+            Class<?> appContextClass = findClass(classLoader, "com.tencent.mm.sdk.platformtools.x2");
+            Field field = findFieldAny(appContextClass, "f210311a", "a");
+            if (field.get(null) == null) {
+                findMethod(appContextClass, "u", Context.class).invoke(null, context);
+                log("initialized WeChat MMApplicationContext early from lifecycle hook");
+            }
+        } catch (Throwable t) {
+            log("early MMApplicationContext init failed: " + shortError(t));
+        }
+    }
+
+    /**
+     * Initializes WeChat's generated build metadata before wallet NetScenes are
+     * constructed. WeChat 8.0.77's request builder decodes
+     * com.tencent.mm.sdk.platformtools.z.g as an integer; on the Android 16 cloned
+     * profile this field can still be null when the bridge worker handles its first
+     * transfer command. Use WeChat's own SetupBaseBuildInfo entry point instead of
+     * copying a version constant into one field, so all dependent metadata stays
+     * consistent across supported builds.
+     */
+    private static void ensureWeChatBuildInfo(Context context, ClassLoader classLoader) {
+        if (context == null || classLoader == null) {
+            return;
+        }
+        try {
+            Class<?> buildInfoClass = findClass(classLoader, "com.tencent.mm.sdk.platformtools.z");
+            Field clientVersionField = findFieldAny(buildInfoClass, "f198356g", "g");
+            Object currentValue = clientVersionField.get(null);
+            if (isDecodableInteger(currentValue)) {
+                return;
+            }
+
+            Class<?> setupClass = findClass(classLoader, "com.tencent.mm.app.u5");
+            findMethod(setupClass, "a", Context.class).invoke(null, context);
+            Object initializedValue = clientVersionField.get(null);
+            if (!isDecodableInteger(initializedValue)) {
+                throw new IllegalStateException("WeChat client version is still unavailable after SetupBaseBuildInfo");
+            }
+            log("initialized WeChat build info early from lifecycle hook");
+        } catch (Throwable t) {
+            log("early WeChat build info init failed: " + fullErrorChain(t));
+        }
+    }
+
+    private static boolean isDecodableInteger(Object value) {
+        if (!(value instanceof String) || isBlank((String) value)) {
+            return false;
+        }
+        try {
+            Integer.decode((String) value);
+            return true;
+        } catch (NumberFormatException ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * Activates WeChat's wallet feature through its own service manager. The wallet
+     * service's onCreate callback loads libtenpay_utils and performs the other wallet
+     * registrations as one lifecycle operation. This keeps ART's JNI association and
+     * WeChat's internal loaded-library state consistent.
+     */
+    private static void ensureWalletPluginInitialized(ClassLoader classLoader) throws Exception {
+        if (WALLET_PLUGIN_INITIALIZED.get()) {
+            return;
+        }
+        synchronized (WALLET_PLUGIN_INITIALIZED) {
+            if (WALLET_PLUGIN_INITIALIZED.get()) {
+                return;
+            }
+            Class<?> serviceManagerClass = findClass(classLoader, "sd5.n0");
+            Class<?> walletPluginClass = findClass(classLoader, "ni0.j2");
+            Object walletPlugin = findMethod(serviceManagerClass, "c", Class.class)
+                    .invoke(null, walletPluginClass);
+            if (walletPlugin == null) {
+                throw new IllegalStateException("WeChat wallet feature service is unavailable");
+            }
+            WALLET_PLUGIN_INITIALIZED.set(true);
+            log("initialized WeChat wallet feature service=" + walletPlugin.getClass().getName());
+        }
+    }
+
+    /**
+     * Android 16 can map libtenpay_utils successfully yet leave Encrypt.encrypt
+     * unresolved in a cloned profile. Install a narrowly-scoped Java equivalent of
+     * TenpayUtil.signWith3Des and activate it only while this module constructs a
+     * transfer NetScene. Normal WeChat wallet calls are untouched.
+     */
+    private static void ensureTenpaySignFallbackHook(ClassLoader classLoader) throws Exception {
+        if (TENPAY_SIGN_FALLBACK_HOOKED.get()) {
+            return;
+        }
+        synchronized (TENPAY_SIGN_FALLBACK_HOOKED) {
+            if (TENPAY_SIGN_FALLBACK_HOOKED.get()) {
+                return;
+            }
+            XposedHelpers.findAndHookMethod(
+                    "com.tencent.mm.wallet_core.tenpay.model.o",
+                    classLoader,
+                    "getEncryptUrl",
+                    String.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                            if (!Boolean.TRUE.equals(TENPAY_SIGN_FALLBACK_ACTIVE.get())) {
+                                return;
+                            }
+                            String source = param.args == null || param.args.length == 0
+                                    ? null
+                                    : (String) param.args[0];
+                            param.setResult(TenpaySignFallback.sign(source));
+                            logTenpayTransferFallback("NetSceneTenPayBase.getEncryptUrl");
+                        }
+                    });
+            XposedHelpers.findAndHookMethod(
+                    "com.tenpay.android.wechat.TenpayUtil",
+                    classLoader,
+                    "signWith3Des",
+                    String.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                            if (!Boolean.TRUE.equals(TENPAY_SIGN_FALLBACK_ACTIVE.get())) {
+                                return;
+                            }
+                            String source = param.args == null || param.args.length == 0
+                                    ? null
+                                    : (String) param.args[0];
+                            param.setResult(TenpaySignFallback.sign(source));
+                            if (TENPAY_SIGN_FALLBACK_USED.compareAndSet(false, true)) {
+                                log("using scoped Java Tenpay sign fallback at TenpayUtil");
+                            }
+                            logTenpayTransferFallback("TenpayUtil.signWith3Des");
+                        }
+                    });
+            XposedHelpers.findAndHookMethod(
+                    "com.tenpay.ndk.Encrypt",
+                    classLoader,
+                    "desedeEncode",
+                    String.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                            if (!Boolean.TRUE.equals(TENPAY_SIGN_FALLBACK_ACTIVE.get())) {
+                                return;
+                            }
+                            String raw = param.args == null || param.args.length == 0
+                                    ? null
+                                    : (String) param.args[0];
+                            param.setResult(TenpaySignFallback.encryptRaw(raw));
+                            if (TENPAY_SIGN_FALLBACK_USED.compareAndSet(false, true)) {
+                                log("using scoped Java Tenpay sign fallback at Encrypt.desedeEncode");
+                            }
+                            logTenpayTransferFallback("Encrypt.desedeEncode");
+                        }
+                    });
+            XposedHelpers.findAndHookMethod(
+                    "com.tenpay.ndk.Encrypt",
+                    classLoader,
+                    "encrypt",
+                    byte[].class,
+                    byte[].class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                            if (!Boolean.TRUE.equals(TENPAY_SIGN_FALLBACK_ACTIVE.get())) {
+                                return;
+                            }
+                            byte[] key = param.args == null ? null : (byte[]) param.args[0];
+                            byte[] raw = param.args == null ? null : (byte[]) param.args[1];
+                            findField(param.thisObject.getClass(), "enc_buf")
+                                    .set(param.thisObject, TenpaySignFallback.encryptRaw(raw, key));
+                            param.setResult(Boolean.TRUE);
+                            if (TENPAY_SIGN_FALLBACK_USED.compareAndSet(false, true)) {
+                                log("using scoped Java Tenpay sign fallback at Encrypt.encrypt");
+                            }
+                            logTenpayTransferFallback("Encrypt.encrypt");
+                        }
+                    });
+            TENPAY_SIGN_FALLBACK_HOOKED.set(true);
+            log("hooked scoped Tenpay sign fallback");
+        }
+    }
+
+    private static Object newTransferScene(Constructor<?> constructor, Object... args) throws Exception {
+        Boolean previous = TENPAY_SIGN_FALLBACK_ACTIVE.get();
+        Boolean previousTransfer = TENPAY_SIGN_FALLBACK_TRANSFER_ACTIVE.get();
+        TENPAY_SIGN_FALLBACK_ACTIVE.set(Boolean.TRUE);
+        TENPAY_SIGN_FALLBACK_TRANSFER_ACTIVE.set(Boolean.TRUE);
+        try {
+            return newTransferSceneWithJavaSignature(constructor, args);
+        } finally {
+            if (previous == null) {
+                TENPAY_SIGN_FALLBACK_ACTIVE.remove();
+            } else {
+                TENPAY_SIGN_FALLBACK_ACTIVE.set(previous);
+            }
+            if (previousTransfer == null) {
+                TENPAY_SIGN_FALLBACK_TRANSFER_ACTIVE.remove();
+            } else {
+                TENPAY_SIGN_FALLBACK_TRANSFER_ACTIVE.set(previousTransfer);
+            }
+        }
+    }
+
+    /**
+     * WeChat 8.0.77 calls Tenpay's unresolved JNI entry directly from compiled
+     * constructor code on Android 16 cloned profiles, bypassing Java hooks even
+     * after deoptimization. Allocate the two known NetScene types without running
+     * their constructors, then reproduce those constructors and z0.setRequestData
+     * exactly while supplying the already-tested Java WCPaySign implementation.
+     */
+    private static Object newTransferSceneWithJavaSignature(
+            Constructor<?> constructor,
+            Object[] args) throws Exception {
+        Class<?> sceneClass = constructor.getDeclaringClass();
+        String className = sceneClass.getName();
+        if (!"com.tencent.mm.plugin.remittance.model.h1".equals(className)
+                && !"com.tencent.mm.plugin.remittance.model.n0".equals(className)) {
+            return constructor.newInstance(args);
+        }
+
+        Object scene = allocateXposedObject(sceneClass);
+        initializeTransferSceneDefaults(scene);
+        Map<String, String> request = new HashMap<>();
+        if ("com.tencent.mm.plugin.remittance.model.h1".equals(className)) {
+            initializeTransferQueryScene(scene, args, request);
+        } else {
+            initializeTransferConfirmScene(scene, args, request);
+        }
+        prepareTransferRequest(scene, request, sceneClass.getClassLoader());
+        if (TENPAY_SIGN_FALLBACK_TRANSFER_USED.compareAndSet(false, true)) {
+            log("constructed transfer NetScene with Java WCPaySign class=" + className);
+        }
+        return scene;
+    }
+
+    private static Object allocateXposedObject(Class<?> targetClass) throws Exception {
+        ClassLoader bridgeLoader = XposedBridge.class.getClassLoader();
+        Class<?> hookBridge = Class.forName(
+                "org.lsposed.lspd.core.nativebridge.HookBridge",
+                false,
+                bridgeLoader);
+        Object allocated = findMethod(hookBridge, "allocateObject", Class.class)
+                .invoke(null, targetClass);
+        if (allocated == null) {
+            throw new IllegalStateException("LSPosed failed to allocate " + targetClass.getName());
+        }
+        return allocated;
+    }
+
+    /**
+     * HookBridge.allocateObject skips every constructor in the n0/h1 -> o -> z0 ->
+     * d1 -> m1 chain, so none of m1's field initializers run. Per handoff doc
+     * 13.39, dexdump of the Tinker-patched com.tencent.mm.modelbase.m1.<init>
+     * shows it sets netId = -1 (a "not yet dispatched" sentinel) and
+     * limit = -99 (LIMIT_NOT_INITIALIZED); a raw-allocated object instead has
+     * both at Java's int default of 0. If the real dispatch/queue code branches
+     * on netId != -1 to decide whether a scene has already been sent, our scenes
+     * would look "already dispatched" from the moment they're created and the
+     * request would never actually reach the network -- callback timeout,
+     * with zero errors anywhere, exactly matching what's been observed. Restore
+     * both sentinels here so the scene looks freshly-constructed to that check.
+     */
+    private static void initializeTransferSceneDefaults(Object scene) throws Exception {
+        setObjectField(scene, "", "mProcessName");
+        setObjectField(scene, "", "payFlag");
+        setObjectField(scene, "", "payAppUrl");
+        setObjectField(scene, "", "wappay_jumped_url");
+        setObjectField(scene, "", "crt_token");
+        setObjectField(scene, new HashMap<String, String>(), "_request");
+        setIntField(scene, "netId", -1);
+        setIntField(scene, "limit", -99);
+    }
+
+    private static void initializeTransferQueryScene(
+            Object scene,
+            Object[] args,
+            Map<String, String> request) throws Exception {
+        int queryType = ((Number) args[0]).intValue();
+        String transactionId = (String) args[1];
+        String transferId = (String) args[2];
+        int invalidTime = ((Number) args[3]).intValue();
+        String groupUsername = (String) args[4];
+        String attach = (String) args[5];
+
+        setObjectField(scene, transferId, "d");
+        setIntField(scene, "q", queryType);
+        setObjectField(scene, "", "G");
+        request.put("transfer_id", transferId);
+        request.put("trans_id", transactionId);
+        request.put("invalid_time", String.valueOf(invalidTime));
+        request.put("group_username", groupUsername);
+        putEncodedTransferAttach(request, attach);
+    }
+
+    private static void initializeTransferConfirmScene(
+            Object scene,
+            Object[] args,
+            Map<String, String> request) throws Exception {
+        String transactionId = (String) args[0];
+        String transferId = (String) args[1];
+        int amountMinor = ((Number) args[2]).intValue();
+        String operation = (String) args[3];
+        String username = (String) args[4];
+        int invalidTime = ((Number) args[5]).intValue();
+        String groupUsername = (String) args[6];
+        int receiveAccountType = ((Number) args[7]).intValue();
+        String bindSerial = (String) args[8];
+        long subReceiveChannelId = ((Number) args[10]).longValue();
+        String receiver = (String) args[11];
+        String attach = (String) args[12];
+
+        setObjectField(scene, operation, "d");
+        setObjectField(scene, "", "g");
+        setObjectField(scene, "", "h");
+        setObjectField(scene, receiver, "m");
+        setObjectField(scene, groupUsername, "n");
+        request.put("trans_id", transferId);
+        request.put("transaction_id", transactionId);
+        request.put("op", operation);
+        request.put("username", username);
+        request.put("invalid_time", String.valueOf(invalidTime));
+        request.put("total_fee", String.valueOf(amountMinor));
+        request.put("left_button_continue", "");
+        request.put("group_username", groupUsername);
+        request.put("sub_recv_channel_id", String.valueOf(subReceiveChannelId));
+        request.put("recv_account_type", String.valueOf(receiveAccountType));
+        if (!isBlank(groupUsername)) {
+            request.put("group_type", isChatroomTalker(groupUsername) ? "2" : "1");
+        }
+        if (!isBlank(bindSerial)) {
+            request.put("bind_serial", bindSerial);
+        }
+        putEncodedTransferAttach(request, attach);
+    }
+
+    private static void putEncodedTransferAttach(Map<String, String> request, String attach)
+            throws Exception {
+        if (!isBlank(attach)) {
+            request.put("transfer_attach", java.net.URLEncoder.encode(
+                    attach,
+                    StandardCharsets.UTF_8.name()));
+        }
+    }
+
+    private static void prepareTransferRequest(
+            Object scene,
+            Map<String, String> request,
+            ClassLoader classLoader) throws Exception {
+        request.remove("uin");
+        Class<?> walletRequestKey = findClass(classLoader, "o85.y");
+        Object hasRequestKey = findNoArgMethod(walletRequestKey, "c").invoke(null);
+        if (hasRequestKey instanceof Boolean && !((Boolean) hasRequestKey)) {
+            Object jsapiRequestKey = findField(walletRequestKey, "a").get(null);
+            if (jsapiRequestKey instanceof String) {
+                request.put("jsapi_reqkey", (String) jsapiRequestKey);
+            }
+        }
+        findField(scene.getClass(), "_request").set(scene, new HashMap<>(request));
+        findMethod(scene.getClass(), "configRequest", boolean.class, boolean.class)
+                .invoke(scene, true, true);
+
+        Object requestResponse = findField(scene.getClass(), "rr").get(scene);
+        if (requestResponse == null) {
+            throw new IllegalStateException("transfer request/response was not initialized");
+        }
+        Object requestObject = findNoArgMethod(requestResponse.getClass(), "getReqObj")
+                .invoke(requestResponse);
+        findMethod(requestObject.getClass(), "setRouteInfo", int.class)
+                .invoke(requestObject, 0);
+        findMethod(findClass(classLoader, "com.tencent.mm.wallet_core.ui.r1"), "L", String.class)
+                .invoke(null, request.get("req_key"));
+
+        String signedRequest = TenpaySignFallback.appendRequestSignature(request);
+        Class<?> byteStringClass = findClass(classLoader, "y85.sz5");
+        Object byteString = findConstructor(byteStringClass).newInstance();
+        findMethod(byteStringClass, "d", byte[].class)
+                .invoke(byteString, signedRequest.getBytes(StandardCharsets.UTF_8));
+        findMethod(
+                scene.getClass(),
+                "putToReqText",
+                findClass(classLoader, "com.tencent.mm.modelbase.o"),
+                byteStringClass)
+                .invoke(scene, requestResponse, byteString);
+    }
+
+    private static void selfTestTransferSceneConstruction(ClassLoader classLoader) {
+        if (!TENPAY_TRANSFER_SCENE_SELF_TESTED.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            Class<?> queryClass = findClass(
+                    classLoader,
+                    "com.tencent.mm.plugin.remittance.model.h1");
+            Constructor<?> queryConstructor = findConstructor(
+                    queryClass,
+                    int.class,
+                    String.class,
+                    String.class,
+                    int.class,
+                    String.class,
+                    String.class);
+            Object query = newTransferScene(
+                    queryConstructor,
+                    1,
+                    "self-test-transaction",
+                    "self-test-transfer",
+                    0,
+                    "",
+                    "");
+            if (findField(query.getClass(), "rr").get(query) == null) {
+                throw new IllegalStateException("query request was not initialized");
+            }
+
+            Class<?> confirmClass = findClass(
+                    classLoader,
+                    "com.tencent.mm.plugin.remittance.model.n0");
+            Constructor<?> confirmConstructor = findConstructor(
+                    confirmClass,
+                    String.class,
+                    String.class,
+                    int.class,
+                    String.class,
+                    String.class,
+                    int.class,
+                    String.class,
+                    int.class,
+                    String.class,
+                    Map.class,
+                    long.class,
+                    String.class,
+                    String.class);
+            Object confirm = newTransferScene(
+                    confirmConstructor,
+                    "self-test-transaction",
+                    "self-test-transfer",
+                    1,
+                    "confirm",
+                    "self-test-user",
+                    0,
+                    "",
+                    1,
+                    "",
+                    null,
+                    0L,
+                    "self-test-user",
+                    "");
+            if (findField(confirm.getClass(), "rr").get(confirm) == null) {
+                throw new IllegalStateException("confirm request was not initialized");
+            }
+            log("transfer NetScene Java-signature construction self-test passed");
+        } catch (Throwable t) {
+            log("transfer NetScene Java-signature construction self-test failed: "
+                    + fullErrorChain(t));
+        }
+    }
+
+    private static void logTenpayTransferFallback(String hookPoint) {
+        if (Boolean.TRUE.equals(TENPAY_SIGN_FALLBACK_TRANSFER_ACTIVE.get())
+                && TENPAY_SIGN_FALLBACK_TRANSFER_USED.compareAndSet(false, true)) {
+            log("transfer request entered Java Tenpay fallback at " + hookPoint);
+        }
+    }
+
+    private static void selfTestTenpaySignFallback(ClassLoader classLoader) {
+        if (!TENPAY_SIGN_FALLBACK_SELF_TESTED.compareAndSet(false, true)) {
+            return;
+        }
+        Boolean previous = TENPAY_SIGN_FALLBACK_ACTIVE.get();
+        TENPAY_SIGN_FALLBACK_ACTIVE.set(Boolean.TRUE);
+        try {
+            String expected = TenpaySignFallback.sign("abc");
+            Class<?> tenpayUtilClass = findClass(classLoader, "com.tenpay.android.wechat.TenpayUtil");
+            Object actual = findMethod(tenpayUtilClass, "signWith3Des", String.class)
+                    .invoke(null, "abc");
+            if (!expected.equals(actual)) {
+                throw new IllegalStateException("Tenpay fallback self-test signature mismatch");
+            }
+            log("scoped Tenpay sign fallback self-test passed");
+        } catch (Throwable t) {
+            log("scoped Tenpay sign fallback self-test failed: " + fullErrorChain(t));
+        } finally {
+            if (previous == null) {
+                TENPAY_SIGN_FALLBACK_ACTIVE.remove();
+            } else {
+                TENPAY_SIGN_FALLBACK_ACTIVE.set(previous);
+            }
+        }
+    }
+
+    private static void deoptimizeTenpayCallers(ClassLoader classLoader) {
+        if (!TENPAY_CALLERS_DEOPTIMIZED.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            Method deoptimize = findMethod(XposedBridge.class, "deoptimizeMethod", Member.class);
+            int count = 0;
+            count += deoptimizeDeclaredMethods(
+                    deoptimize,
+                    findClass(classLoader, "com.tenpay.android.wechat.TenpayUtil"),
+                    "signWith3Des");
+            count += deoptimizeDeclaredMethods(
+                    deoptimize,
+                    findClass(classLoader, "com.tenpay.ndk.Encrypt"),
+                    "desedeEncode");
+            count += deoptimizeDeclaredMethods(
+                    deoptimize,
+                    findClass(classLoader, "com.tenpay.ndk.Encrypt"),
+                    "encrypt");
+            count += deoptimizeDeclaredMethods(
+                    deoptimize,
+                    findClass(classLoader, "com.tencent.mm.wallet_core.tenpay.model.o"),
+                    "getEncryptUrl");
+            count += deoptimizeDeclaredMethods(
+                    deoptimize,
+                    findClass(classLoader, "com.tencent.mm.wallet_core.model.z0"),
+                    "setRequestData");
+            count += deoptimizeConstructors(
+                    deoptimize,
+                    findClass(classLoader, "com.tencent.mm.plugin.remittance.model.h1"));
+            count += deoptimizeConstructors(
+                    deoptimize,
+                    findClass(classLoader, "com.tencent.mm.plugin.remittance.model.n0"));
+            log("deoptimized Tenpay transfer callers count=" + count);
+        } catch (Throwable t) {
+            log("deoptimize Tenpay transfer callers failed: " + fullErrorChain(t));
+        }
+    }
+
+    private static int deoptimizeDeclaredMethods(
+            Method deoptimize,
+            Class<?> targetClass,
+            String methodName) throws Exception {
+        int count = 0;
+        for (Method method : targetClass.getDeclaredMethods()) {
+            if (!methodName.equals(method.getName()) || Modifier.isAbstract(method.getModifiers())) {
+                continue;
+            }
+            method.setAccessible(true);
+            deoptimize.invoke(null, method);
+            count++;
+        }
+        return count;
+    }
+
+    private static int deoptimizeConstructors(Method deoptimize, Class<?> targetClass) throws Exception {
+        int count = 0;
+        for (Constructor<?> constructor : targetClass.getDeclaredConstructors()) {
+            constructor.setAccessible(true);
+            deoptimize.invoke(null, constructor);
+            count++;
+        }
+        return count;
+    }
+
+    private static void logWalletClassLoaderDiagnostics(ClassLoader classLoader) {
+        if (classLoader == null || !WALLET_CLASSLOADERS_LOGGED.compareAndSet(false, true)) {
+            return;
+        }
+        String[] classNames = {
+                "lp.a0",
+                "lp.d0",
+                "sd5.n0",
+                "ni0.j2",
+                "com.tenpay.android.wechat.TenpayUtil",
+                "com.tenpay.ndk.Encrypt",
+                "com.tencent.mm.plugin.remittance.model.h1",
+        };
+        log("wallet classloader diag: runtime=" + describeClassLoader(classLoader));
+        for (String className : classNames) {
+            try {
+                Class<?> targetClass = Class.forName(className, false, classLoader);
+                log("wallet classloader diag: " + className + "="
+                        + describeClassLoader(targetClass.getClassLoader()));
+            } catch (Throwable t) {
+                log("wallet classloader diag: " + className + " unavailable: " + shortError(t));
+            }
+        }
+    }
+
+    private static String describeClassLoader(ClassLoader classLoader) {
+        if (classLoader == null) {
+            return "<bootstrap>";
+        }
+        return classLoader.getClass().getName() + "@"
+                + Integer.toHexString(System.identityHashCode(classLoader));
+    }
+
     private static void hookApplicationAttach(final ClassLoader classLoader) {
         try {
             XposedHelpers.findAndHookMethod(
@@ -434,6 +1079,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
                                 APP_CONTEXT = (Context) param.args[0];
                                 hookExternalStorageFallback();
                                 ClassLoader runtimeLoader = param.thisObject == null ? null : param.thisObject.getClass().getClassLoader();
+                                ensureAppContextField(APP_CONTEXT, runtimeLoader == null ? classLoader : runtimeLoader);
+                                ensureWeChatBuildInfo(APP_CONTEXT, runtimeLoader == null ? classLoader : runtimeLoader);
                                 log("Application.attach captured context; start outbox worker");
                                 startWorker(runtimeLoader == null ? classLoader : runtimeLoader);
                             }
@@ -460,6 +1107,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
                                 hookExternalStorageFallback();
                             }
                             ClassLoader runtimeLoader = param.thisObject == null ? null : param.thisObject.getClass().getClassLoader();
+                            ensureAppContextField(APP_CONTEXT, runtimeLoader == null ? classLoader : runtimeLoader);
+                            ensureWeChatBuildInfo(APP_CONTEXT, runtimeLoader == null ? classLoader : runtimeLoader);
                             log("WeChat application init completed; start outbox worker");
                             startWorker(runtimeLoader == null ? classLoader : runtimeLoader);
                         }
@@ -477,6 +1126,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
                                 hookExternalStorageFallback();
                             }
                             ClassLoader runtimeLoader = param.thisObject == null ? null : param.thisObject.getClass().getClassLoader();
+                            ensureAppContextField(APP_CONTEXT, runtimeLoader == null ? classLoader : runtimeLoader);
+                            ensureWeChatBuildInfo(APP_CONTEXT, runtimeLoader == null ? classLoader : runtimeLoader);
+                            logWalletClassLoaderDiagnostics(runtimeLoader == null ? classLoader : runtimeLoader);
                             log("WeChat application onCreate completed; start outbox worker");
                             startWorker(runtimeLoader == null ? classLoader : runtimeLoader);
                         }
@@ -529,6 +1181,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             Long createTime = values.getAsLong("createTime");
             Integer type = values.getAsInteger("type");
             String imgPath = values.getAsString("imgPath");
+            String msgSource = values.getAsString("msgSource");
 
             int messageType = type == null ? 1 : type;
             if (!shouldReportMessage(talker, content, messageType)) {
@@ -550,8 +1203,11 @@ public final class HookEntry implements IXposedHookLoadPackage {
             }
 
             String mediaHint = resolveMediaHint(param.thisObject, messageType, msgId, msgSvrId, imgPath);
-            MessagePayload payload = buildMessagePayload(config, talker, content, isSend, msgId, createTime, messageType, mediaHint);
-            postAsync(config, payload, "handle insert");
+            MessagePayload payload = buildMessagePayload(
+                    config, talker, content, isSend, msgId, createTime, messageType, mediaHint, msgSource);
+            if (!shouldDeferOriginalImagePost(config, messageType, payload)) {
+                postAsync(config, payload, "handle insert");
+            }
             scheduleMediaRetryIfNeeded(config, talker, content, isSend, msgId, msgSvrId, createTime, messageType, mediaHint, payload);
             if (msgId != null && msgId > LAST_MESSAGE_ID) {
                 LAST_MESSAGE_ID = msgId;
@@ -735,9 +1391,38 @@ public final class HookEntry implements IXposedHookLoadPackage {
             if (!isStaticBooleanFlag(classLoader, serviceManager, "f307062f", "f")) {
                 return readyState(false, serviceManager + " service manager not initialized");
             }
+            logWalletClassLoaderDiagnostics(classLoader);
+            ensureTenpaySignFallbackHook(classLoader);
+            deoptimizeTenpayCallers(classLoader);
+            selfTestTenpaySignFallback(classLoader);
+            selfTestTransferSceneConstruction(classLoader);
             return readyState(true, "ready");
         } catch (Throwable t) {
             return readyState(false, "readiness check failed: " + shortError(t));
+        }
+    }
+
+    private static final class NetworkResultWaiter {
+        final CountDownLatch latch = new CountDownLatch(1);
+        volatile int code = Integer.MIN_VALUE;
+        volatile String message = "";
+
+        void complete(Object[] args) {
+            if (args != null && args.length > 0 && args[0] instanceof Number) {
+                code = ((Number) args[0]).intValue();
+            }
+            if (args != null && args.length > 1 && args[1] != null) {
+                message = String.valueOf(args[1]);
+            }
+            latch.countDown();
+        }
+
+        boolean await(long timeoutSeconds) throws InterruptedException {
+            return latch.await(timeoutSeconds, TimeUnit.SECONDS);
+        }
+
+        boolean isComplete() {
+            return latch.getCount() == 0L;
         }
     }
 
@@ -1174,7 +1859,13 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 LAST_MESSAGE_ID = readMaxMessageId(db);
                 MESSAGE_WATERMARK_READY = true;
                 log("message poll watermark initialized msgId=" + LAST_MESSAGE_ID);
-                return;
+            }
+            if (!TRANSFER_STARTUP_BACKFILL_DONE) {
+                int recovered = backfillRecentPendingTransfers(db, config, LAST_MESSAGE_ID);
+                TRANSFER_STARTUP_BACKFILL_DONE = true;
+                if (recovered > 0) {
+                    log("startup pending transfer backfill uploaded count=" + recovered);
+                }
             }
             int count = pollNewMessages(db, config);
             if (count > 0) {
@@ -1216,6 +1907,66 @@ public final class HookEntry implements IXposedHookLoadPackage {
         } finally {
             closeQuietly(cursor);
         }
+    }
+
+    private static int backfillRecentPendingTransfers(Object db, BridgeConfig config, long maxMessageId) throws Exception {
+        if (maxMessageId <= 0L) {
+            return 0;
+        }
+        Object cursor = rawQuery(db, ""
+                + "SELECT msgId,talker,COALESCE(content,''),createTime,type "
+                + "FROM message "
+                + "WHERE msgId <= ? AND isSend=0 AND type IN (?,?) "
+                + "ORDER BY msgId DESC "
+                + "LIMIT " + TRANSFER_STARTUP_BACKFILL_LIMIT,
+                new String[]{
+                        String.valueOf(maxMessageId),
+                        String.valueOf(MESSAGE_TYPE_TRANSFER),
+                        String.valueOf(MESSAGE_TYPE_APPMSG)
+                });
+        if (cursor == null) {
+            return 0;
+        }
+        int count = 0;
+        long nowSeconds = System.currentTimeMillis() / 1000L;
+        try {
+            Method moveToNext = findNoArgMethod(cursor.getClass(), "moveToNext");
+            while (Boolean.TRUE.equals(moveToNext.invoke(cursor))) {
+                long msgId = longColumn(cursor, 0);
+                String talker = stringColumn(cursor, 1);
+                String content = stringColumn(cursor, 2);
+                long createTime = normalizeCreateTime(longColumn(cursor, 3));
+                int type = intColumn(cursor, 4);
+                long ageSeconds = nowSeconds - createTime;
+                if (createTime <= 0L || ageSeconds < -300L
+                        || ageSeconds > TRANSFER_STARTUP_BACKFILL_WINDOW_SECONDS) {
+                    continue;
+                }
+                String normalizedContent = normalizeMessageContent(talker, content, type);
+                TransferMessageParser.Result transfer = TransferMessageParser.parse(normalizedContent);
+                boolean transferType = type == MESSAGE_TYPE_TRANSFER
+                        || (type == MESSAGE_TYPE_APPMSG
+                        && transfer.appMsgType == TransferMessageParser.APPMSG_TYPE_TRANSFER);
+                if (!transferType || !transfer.isPending()) {
+                    continue;
+                }
+                MessagePayload payload = buildMessagePayload(
+                        config,
+                        talker,
+                        content,
+                        Integer.valueOf(0),
+                        Long.valueOf(msgId),
+                        Long.valueOf(createTime),
+                        type,
+                        "",
+                        messageSourceForMessage(db, msgId));
+                post(config, payload);
+                count++;
+            }
+        } finally {
+            closeQuietly(cursor);
+        }
+        return count;
     }
 
     private static int pollNewMessages(Object db, BridgeConfig config) throws Exception {
@@ -1275,8 +2026,20 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 int messageType = type <= 0 ? 1 : type;
                 Long serverId = msgSvrId > 0L ? Long.valueOf(msgSvrId) : null;
                 String mediaHint = resolveMediaHint(db, messageType, Long.valueOf(msgId), serverId, imgPath);
-                MessagePayload payload = buildMessagePayload(config, talker, content, isSend == 1 ? Integer.valueOf(1) : Integer.valueOf(0), msgId, createTime, messageType, mediaHint);
-                post(config, payload);
+                String msgSource = messageSourceForMessage(db, msgId);
+                MessagePayload payload = buildMessagePayload(
+                        config,
+                        talker,
+                        content,
+                        isSend == 1 ? Integer.valueOf(1) : Integer.valueOf(0),
+                        msgId,
+                        createTime,
+                        messageType,
+                        mediaHint,
+                        msgSource);
+                if (!shouldDeferOriginalImagePost(config, messageType, payload)) {
+                    post(config, payload);
+                }
                 LAST_MESSAGE_ID = msgId;
                 rememberMediaUpload(payload);
                 scheduleMediaRetryIfNeeded(config, talker, content, isSend == 1 ? Integer.valueOf(1) : Integer.valueOf(0), msgId, serverId, createTime, messageType, mediaHint, payload);
@@ -1305,6 +2068,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
         final long recordId = msgId.longValue();
         if (!markMediaRetryScheduled(recordId)) {
             return;
+        }
+        if (type == 3) {
+            requestOriginalImageDownloadAsync(recordId, msgSvrId, talker);
         }
         Thread worker = new Thread(new Runnable() {
             @Override
@@ -1344,6 +2110,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 if (!isTargetAndroidUser(config) || !bindRuntimeIdentity(config) || !ensureRegistered(config)) {
                     return;
                 }
+                if (type == 3) {
+                    requestOriginalImageDownloadAsync(recordId, msgSvrId, talker);
+                }
                 String latestHint = resolveMediaHint(LAST_DATABASE, type, Long.valueOf(recordId), msgSvrId, mediaHint);
                 MessagePayload payload = buildMessagePayload(config, talker, content, isSend, recordId, createTime, type, latestHint);
                 if (isBlank(payload.mediaBase64)) {
@@ -1361,6 +2130,365 @@ public final class HookEntry implements IXposedHookLoadPackage {
             }
         }
         log("media retry exhausted type=" + type + " msgId=" + recordId);
+    }
+
+    private static boolean shouldDeferOriginalImagePost(BridgeConfig config, int type, MessagePayload payload) {
+        if (type != 3 || config == null || !config.mediaUploadEnabled || payload == null
+                || !isBlank(payload.mediaBase64)) {
+            return false;
+        }
+        return supportsOriginalImageDownload();
+    }
+
+    private static boolean supportsOriginalImageDownload() {
+        WeChatVersionSymbols.Profile symbols = WECHAT_SYMBOLS;
+        if (symbols != null) {
+            return symbols.originalImageDownloadSupported;
+        }
+        ClassLoader classLoader = WECHAT_CLASS_LOADER;
+        if (classLoader == null) {
+            return false;
+        }
+        try {
+            return weChatSymbols(runtimeClassLoader(classLoader)).originalImageDownloadSupported;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static void requestOriginalImageDownloadAsync(final long recordId, final Long msgSvrId, final String talker) {
+        if (recordId <= 0L || isBlank(talker) || !supportsOriginalImageDownload()
+                || !markOriginalImageDownloadDispatched(recordId)) {
+            return;
+        }
+        Runnable request = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    requestOriginalImageDownload(recordId, msgSvrId, talker);
+                } catch (Throwable t) {
+                    forgetOriginalImageDownloadDispatch(recordId);
+                    log("original image download request failed msgId=" + recordId
+                            + " error=" + shortError(rootCause(t)));
+                }
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            request.run();
+            return;
+        }
+        if (!new Handler(Looper.getMainLooper()).post(request)) {
+            forgetOriginalImageDownloadDispatch(recordId);
+        }
+    }
+
+    private static void requestOriginalImageDownload(long recordId, Long msgSvrId, String talker) throws Exception {
+        ClassLoader classLoader = runtimeClassLoader(WECHAT_CLASS_LOADER);
+        if (classLoader == null) {
+            throw new IllegalStateException("WeChat class loader is unavailable");
+        }
+        ImageInfoRecord imageInfo = queryImageInfoRecord(
+                LAST_DATABASE,
+                Long.valueOf(recordId),
+                msgSvrId);
+        if (imageInfo == null || imageInfo.id <= 0L) {
+            imageInfo = imageInfoFromWechatStorage(classLoader, recordId, msgSvrId, talker);
+        }
+        if (imageInfo == null || imageInfo.id <= 0L) {
+            forgetOriginalImageDownloadDispatch(recordId);
+            return;
+        }
+
+        int resourceType = imageInfo.hdId > 0L ? 1 : 0;
+        ImageInfoRecord selected = imageInfo;
+        if (resourceType == 1) {
+            ImageInfoRecord hd = queryImageInfoRecordById(LAST_DATABASE, imageInfo.hdId);
+            if (hd == null) {
+                hd = imageInfoByIdFromWechatStorage(classLoader, imageInfo.hdId);
+            }
+            selected = hd == null ? new ImageInfoRecord() : hd;
+        }
+        if (!isBlank(completeOriginalImageHint(selected))) {
+            return;
+        }
+
+        Class<?> serviceManagerClass = findVersionedClass(classLoader, "i95.n0");
+        WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
+        Class<?> imageFeatureClass = findVersionedClass(classLoader, "h70.y");
+        Object imageFeature = findMethod(serviceManagerClass, "c", Class.class)
+                .invoke(null, imageFeatureClass);
+        Object downloadService = findNoArgMethod(imageFeature.getClass(), symbols.methods.imageDownloadService)
+                .invoke(imageFeature);
+        if (downloadService == null) {
+            throw new IllegalStateException("WeChat image download service is unavailable");
+        }
+
+        Class<?> msgIdTalkerClass = findClass(classLoader, "com.tencent.mm.plugin.msg.MsgIdTalker");
+        Object msgIdTalker = findConstructor(msgIdTalkerClass, long.class, String.class)
+                .newInstance(recordId, talker);
+        Class<?> callbackClass = findVersionedClass(classLoader, "h70.w");
+        Object callback = Proxy.newProxyInstance(
+                classLoader,
+                new Class<?>[]{callbackClass},
+                originalImageDownloadCallback(recordId));
+        Method enqueue = findMethod(
+                downloadService.getClass(),
+                "b",
+                long.class,
+                msgIdTalkerClass,
+                int.class,
+                Object.class,
+                int.class,
+                callbackClass,
+                int.class,
+                boolean.class);
+        Object result = enqueue.invoke(
+                downloadService,
+                imageInfo.id,
+                msgIdTalker,
+                resourceType,
+                Integer.valueOf(-1),
+                -1,
+                callback,
+                0,
+                true);
+        int code = result instanceof Number ? ((Number) result).intValue() : -1;
+        if (code < 0 && code != -2) {
+            forgetOriginalImageDownloadDispatch(recordId);
+            throw new IllegalStateException("WeChat image download enqueue returned " + code);
+        }
+        log("original image download requested msgId=" + recordId
+                + " resource=" + (resourceType == 1 ? "hd" : "large")
+                + " result=" + code);
+    }
+
+    private static ImageInfoRecord imageInfoFromWechatStorage(
+            ClassLoader classLoader,
+            long recordId,
+            Long msgSvrId,
+            String talker) throws Exception {
+        Object storage = wechatImageStorage(classLoader);
+        if (storage == null) {
+            return null;
+        }
+        Object model = null;
+        if (msgSvrId != null && msgSvrId > 0L) {
+            model = findMethod(storage.getClass(), "K2", String.class, long.class)
+                    .invoke(storage, talker, msgSvrId.longValue());
+        }
+        ImageInfoRecord record = imageInfoFromWechatModel(model);
+        if ((record == null || record.id <= 0L) && recordId > 0L) {
+            model = findMethod(storage.getClass(), "A2", String.class, long.class)
+                    .invoke(storage, talker, recordId);
+            record = imageInfoFromWechatModel(model);
+        }
+        return record;
+    }
+
+    private static ImageInfoRecord imageInfoByIdFromWechatStorage(ClassLoader classLoader, long imageInfoId)
+            throws Exception {
+        if (imageInfoId <= 0L) {
+            return null;
+        }
+        Object storage = wechatImageStorage(classLoader);
+        if (storage == null) {
+            return null;
+        }
+        Object model = findMethod(storage.getClass(), "U1", Long.class)
+                .invoke(storage, Long.valueOf(imageInfoId));
+        return imageInfoFromWechatModel(model);
+    }
+
+    private static Object wechatImageStorage(ClassLoader classLoader) throws Exception {
+        WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
+        Class<?> serviceManagerClass = findVersionedClass(classLoader, "i95.n0");
+        Class<?> imageFeatureClass = findVersionedClass(classLoader, "h70.y");
+        Object imageFeature = findMethod(serviceManagerClass, "c", Class.class)
+                .invoke(null, imageFeatureClass);
+        return imageFeature == null
+                ? null
+                : findNoArgMethod(imageFeature.getClass(), symbols.methods.imageStorage).invoke(imageFeature);
+    }
+
+    private static ImageInfoRecord imageInfoFromWechatModel(Object model) throws Exception {
+        if (model == null) {
+            return null;
+        }
+        ImageInfoRecord record = new ImageInfoRecord();
+        record.id = getLongField(model, "a", "f386887a");
+        record.hdId = getLongField(model, "q", "f386903q");
+        record.offset = (int) getLongField(model, "c", "f386889c");
+        record.totalLen = (int) getLongField(model, "d", "f386890d");
+        record.bigPath = getStringField(model, "e", "f386891e");
+        record.midPath = getStringField(model, "f", "f386892f");
+        return record;
+    }
+
+    private static InvocationHandler originalImageDownloadCallback(final long recordId) {
+        return new InvocationHandler() {
+            @Override
+            public Object invoke(Object proxy, Method method, Object[] args) {
+                String name = method.getName();
+                if ("hashCode".equals(name)) {
+                    return System.identityHashCode(proxy);
+                }
+                if ("equals".equals(name)) {
+                    return args != null && args.length == 1 && proxy == args[0];
+                }
+                if ("toString".equals(name)) {
+                    return "ObservatoryOriginalImageCallback(" + recordId + ")";
+                }
+                if ("f".equals(name) || "c".equals(name)) {
+                    int errorType = intArgument(args, 6);
+                    int errorCode = intArgument(args, 7);
+                    if (errorType != 0 || errorCode != 0) {
+                        forgetOriginalImageDownloadDispatch(recordId);
+                    } else {
+                        captureOriginalImageDownloadPath(recordId, args);
+                    }
+                    log("original image download completed msgId=" + recordId
+                            + " errorType=" + errorType
+                            + " errorCode=" + errorCode);
+                } else if ("n".equals(name) || "l".equals(name)) {
+                    forgetOriginalImageDownloadDispatch(recordId);
+                }
+                return defaultValue(method.getReturnType());
+            }
+        };
+    }
+
+    private static void captureOriginalImageDownloadPath(long recordId, Object[] args) {
+        try {
+            Object scene = args != null && args.length > 9 ? args[9] : null;
+            if (scene == null) {
+                logOriginalImageDiagnostic(recordId, "download callback scene is missing");
+                return;
+            }
+            String vfsPath = getStringField(scene, "y", "f387049y");
+            if (isBlank(vfsPath)) {
+                logOriginalImageDiagnostic(recordId, "download callback path is empty");
+                return;
+            }
+            String localPath = materializeOriginalImagePath(recordId, scene.getClass().getClassLoader(), vfsPath);
+            if (isBlank(localPath)) {
+                logOriginalImageDiagnostic(recordId, "downloaded image could not be materialized");
+                return;
+            }
+            rememberOriginalImageDownloadedPath(recordId, localPath);
+            File file = new File(localPath);
+            log("original image callback path ready msgId=" + recordId
+                    + " exists=" + file.isFile()
+                    + " size=" + (file.isFile() ? file.length() : 0L));
+        } catch (Throwable t) {
+            logOriginalImageDiagnostic(recordId, "download callback path failed: " + shortError(rootCause(t)));
+        }
+    }
+
+    private static String materializeOriginalImagePath(
+            long recordId,
+            ClassLoader classLoader,
+            String vfsPath) throws Exception {
+        Class<?> vfsClass = findVersionedClass(classLoader, "com.tencent.mm.vfs.w6");
+        Object rawPath = findMethod(vfsClass, "i", String.class, boolean.class)
+                .invoke(null, vfsPath, false);
+        String directPath = rawPath == null ? "" : String.valueOf(rawPath);
+        if (!isBlank(directPath)) {
+            File direct = new File(directPath);
+            if (direct.isFile() && direct.length() > 0L) {
+                return direct.getAbsolutePath();
+            }
+        }
+
+        Context context = bridgeContext();
+        File cacheRoot = context == null ? null : context.getCacheDir();
+        if (cacheRoot == null) {
+            throw new IOException("inbound image cache is unavailable");
+        }
+        File dir = new File(cacheRoot, "wechat-observatory-inbound");
+        if (!dir.isDirectory() && !dir.mkdirs()) {
+            throw new IOException("create inbound image cache failed");
+        }
+        File target = new File(dir, "image-" + recordId + ".img");
+        Object opened = findMethod(vfsClass, "B", String.class, boolean.class)
+                .invoke(null, vfsPath, false);
+        if (!(opened instanceof java.io.RandomAccessFile)) {
+            throw new IOException("WeChat VFS did not return a readable image file");
+        }
+        try (java.io.RandomAccessFile input = (java.io.RandomAccessFile) opened;
+             FileOutputStream output = new FileOutputStream(target, false)) {
+            long length = input.length();
+            if (length <= 0L || length > OUTBOX_MEDIA_DOWNLOAD_LIMIT_BYTES) {
+                throw new IOException("downloaded image size is invalid: " + length);
+            }
+            input.seek(0L);
+            byte[] buffer = new byte[8192];
+            int read;
+            long total = 0L;
+            while ((read = input.read(buffer)) != -1) {
+                total += read;
+                if (total > OUTBOX_MEDIA_DOWNLOAD_LIMIT_BYTES) {
+                    throw new IOException("downloaded image exceeds cache limit");
+                }
+                output.write(buffer, 0, read);
+            }
+        }
+        return target.isFile() && target.length() > 0L ? target.getAbsolutePath() : "";
+    }
+
+    private static void rememberOriginalImageDownloadedPath(long recordId, String path) {
+        if (recordId <= 0L || isBlank(path)) {
+            return;
+        }
+        synchronized (ORIGINAL_IMAGE_DOWNLOADED_PATHS) {
+            if (ORIGINAL_IMAGE_DOWNLOADED_PATHS.size() >= 256) {
+                ORIGINAL_IMAGE_DOWNLOADED_PATHS.clear();
+            }
+            ORIGINAL_IMAGE_DOWNLOADED_PATHS.put(Long.valueOf(recordId), path);
+        }
+    }
+
+    private static String originalImageDownloadedPath(Long recordId) {
+        if (recordId == null || recordId <= 0L) {
+            return "";
+        }
+        synchronized (ORIGINAL_IMAGE_DOWNLOADED_PATHS) {
+            String path = ORIGINAL_IMAGE_DOWNLOADED_PATHS.get(recordId);
+            return path == null ? "" : path;
+        }
+    }
+
+    private static void logOriginalImageDiagnostic(long recordId, String message) {
+        synchronized (ORIGINAL_IMAGE_DIAGNOSTIC_REPORTED_IDS) {
+            if (ORIGINAL_IMAGE_DIAGNOSTIC_REPORTED_IDS.size() >= 1024) {
+                ORIGINAL_IMAGE_DIAGNOSTIC_REPORTED_IDS.clear();
+            }
+            if (!ORIGINAL_IMAGE_DIAGNOSTIC_REPORTED_IDS.add(Long.valueOf(recordId))) {
+                return;
+            }
+        }
+        log("original image diagnostic msgId=" + recordId + " error=" + message);
+    }
+
+    private static int intArgument(Object[] args, int index) {
+        if (args == null || index < 0 || index >= args.length || !(args[index] instanceof Number)) {
+            return 0;
+        }
+        return ((Number) args[index]).intValue();
+    }
+
+    private static boolean markOriginalImageDownloadDispatched(long recordId) {
+        synchronized (ORIGINAL_IMAGE_DOWNLOAD_DISPATCHED_IDS) {
+            if (ORIGINAL_IMAGE_DOWNLOAD_DISPATCHED_IDS.size() > 1024) {
+                ORIGINAL_IMAGE_DOWNLOAD_DISPATCHED_IDS.clear();
+            }
+            return ORIGINAL_IMAGE_DOWNLOAD_DISPATCHED_IDS.add(recordId);
+        }
+    }
+
+    private static void forgetOriginalImageDownloadDispatch(long recordId) {
+        synchronized (ORIGINAL_IMAGE_DOWNLOAD_DISPATCHED_IDS) {
+            ORIGINAL_IMAGE_DOWNLOAD_DISPATCHED_IDS.remove(recordId);
+        }
     }
 
     private static void sleepQuietly(long millis) {
@@ -1476,6 +2604,20 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static MessagePayload buildMessagePayload(BridgeConfig config, String talker, String content, Integer isSend, Long msgId, Long createTime, int type, String mediaHint) {
+        return buildMessagePayload(
+                config, talker, content, isSend, msgId, createTime, type, mediaHint, "");
+    }
+
+    private static MessagePayload buildMessagePayload(
+            BridgeConfig config,
+            String talker,
+            String content,
+            Integer isSend,
+            Long msgId,
+            Long createTime,
+            int type,
+            String mediaHint,
+            String msgSource) {
         MessagePayload payload = new MessagePayload();
         String normalizedTalker = talker == null ? "" : talker.trim();
         boolean chatroom = isChatroomTalker(normalizedTalker);
@@ -1506,6 +2648,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             payload.from = normalizedTalker;
             payload.to = config.selfWxid;
             payload.sender = chatroom ? extractChatroomSender(content) : "";
+            payload.atSelf = chatroom && InboundMentionPolicy.mentionsSelf(msgSource, config.selfWxid);
         }
         return payload;
     }
@@ -1575,6 +2718,28 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static String resolveMediaHint(Object db, int type, Long msgId, Long msgSvrId, String mediaHint) {
+        if (type == 3 && supportsOriginalImageDownload()) {
+            String downloadedPath = originalImageDownloadedPath(msgId);
+            if (!isBlank(downloadedPath)) {
+                return downloadedPath;
+            }
+            try {
+                String imageHint = imageMediaHintFromWechatStorage(db, msgId, msgSvrId);
+                if (!isBlank(imageHint)) {
+                    return imageHint;
+                }
+            } catch (Throwable t) {
+                logOriginalImageDiagnostic(
+                        msgId == null ? 0L : msgId.longValue(),
+                        "storage path failed: " + shortError(rootCause(t)));
+            }
+        }
+        if (type == 3 && db != null) {
+            String imageHint = imageMediaHintFromInfoTable(db, msgId, msgSvrId);
+            if (!isBlank(imageHint)) {
+                return imageHint;
+            }
+        }
         if (type == 34 && db != null) {
             String voiceHint = voiceMediaHintFromInfoTable(db, msgId, msgSvrId);
             if (!isBlank(voiceHint)) {
@@ -1588,6 +2753,242 @@ public final class HookEntry implements IXposedHookLoadPackage {
             }
         }
         return mediaHint;
+    }
+
+    private static String imageMediaHintFromInfoTable(Object db, Long msgId, Long msgSvrId) {
+        ImageInfoRecord base = queryImageInfoRecord(db, msgId, msgSvrId);
+        if (base == null) {
+            return "";
+        }
+        ImageInfoRecord selected = base;
+        if (base.hdId > 0L) {
+            selected = queryImageInfoRecordById(db, base.hdId);
+            if (selected == null) {
+                return "";
+            }
+        }
+        return completeOriginalImageHint(selected);
+    }
+
+    private static String wechatImageFullPath(
+            ClassLoader classLoader,
+            String talker,
+            long msgId,
+            int resourceType,
+            String logicalPath) throws Exception {
+        if (isBlank(talker) || msgId <= 0L || isBlank(logicalPath)) {
+            return "";
+        }
+        WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
+        Class<?> messageStorageClass = findVersionedClass(classLoader, "qt0.k0");
+        Class<?> messageClass = findVersionedClass(classLoader, "com.tencent.mm.storage.f9");
+        Object message = findMethod(messageStorageClass, symbols.methods.imageMessageLookup, String.class, long.class)
+                .invoke(null, talker, msgId);
+        if (message == null) {
+            return "";
+        }
+
+        Class<?> serviceManagerClass = findVersionedClass(classLoader, "i95.n0");
+        Class<?> pathServiceClass = findVersionedClass(classLoader, "tg3.u0");
+        Object pathService = findMethod(serviceManagerClass, "c", Class.class)
+                .invoke(null, pathServiceClass);
+        Class<?> imageTypeClass = findVersionedClass(classLoader, "bm5.f0");
+        Object imageType = findFieldAny(
+                imageTypeClass,
+                resourceType == 1 ? "g" : "h",
+                resourceType == 1 ? "f320138g" : "f320139h").get(null);
+        Object resolved;
+        if (resourceType == 1) {
+            resolved = findMethod(
+                    pathService.getClass(),
+                    symbols.methods.imageHdPath,
+                    messageClass,
+                    imageTypeClass,
+                    String.class,
+                    String.class,
+                    String.class).invoke(pathService, message, imageType, logicalPath, "", "");
+        } else {
+            resolved = findMethod(
+                    pathService.getClass(),
+                    symbols.methods.imageLargePath,
+                    messageClass,
+                    imageTypeClass,
+                    String.class,
+                    String.class,
+                    String.class,
+                    boolean.class,
+                    boolean.class).invoke(pathService, message, imageType, logicalPath, "", "", true, false);
+        }
+        String vfsPath = resolved == null ? "" : String.valueOf(resolved);
+        if (isBlank(vfsPath)) {
+            return "";
+        }
+        Object rawPath = findMethod(
+                findVersionedClass(classLoader, "com.tencent.mm.vfs.w6"),
+                "i",
+                String.class,
+                boolean.class).invoke(null, vfsPath, false);
+        String path = rawPath == null ? vfsPath : String.valueOf(rawPath);
+        File file = new File(path);
+        log("original image path resolved msgId=" + msgId
+                + " resource=" + (resourceType == 1 ? "hd" : "large")
+                + " exists=" + file.isFile()
+                + " size=" + (file.isFile() ? file.length() : 0L));
+        return path;
+    }
+
+    private static String imageMediaHintFromWechatStorage(Object db, Long msgId, Long msgSvrId)
+            throws Exception {
+        ClassLoader classLoader = runtimeClassLoader(WECHAT_CLASS_LOADER);
+        if (classLoader == null) {
+            return "";
+        }
+        String talker = imageTalkerForMessage(db, msgId);
+        if (isBlank(talker)) {
+            return "";
+        }
+        ImageInfoRecord base = imageInfoFromWechatStorage(
+                classLoader,
+                msgId == null ? 0L : msgId.longValue(),
+                msgSvrId,
+                talker);
+        if (base == null) {
+            return "";
+        }
+        ImageInfoRecord selected = base;
+        if (base.hdId > 0L) {
+            selected = imageInfoByIdFromWechatStorage(classLoader, base.hdId);
+            if (selected == null) {
+                return "";
+            }
+        }
+        String logicalPath = completeOriginalImageHint(selected);
+        if (isBlank(logicalPath)) {
+            return "";
+        }
+        String fullPath = wechatImageFullPath(
+                classLoader,
+                talker,
+                msgId == null ? 0L : msgId.longValue(),
+                base.hdId > 0L ? 1 : 0,
+                logicalPath);
+        return isBlank(fullPath) ? logicalPath : fullPath;
+    }
+
+    private static String completeOriginalImageHint(ImageInfoRecord record) {
+        if (record == null || !record.isComplete()) {
+            return "";
+        }
+        if (!isBlank(record.bigPath) && !InboundImagePolicy.isThumbnailPath(record.bigPath)) {
+            return record.bigPath;
+        }
+        if (!isBlank(record.midPath) && !InboundImagePolicy.isThumbnailPath(record.midPath)) {
+            return record.midPath;
+        }
+        return "";
+    }
+
+    private static String imageTalkerForMessage(Object db, Long msgId) {
+        if (db == null || msgId == null || msgId <= 0L) {
+            return "";
+        }
+        Object cursor = null;
+        try {
+            cursor = rawQuery(
+                    db,
+                    "SELECT talker FROM message WHERE msgId=? LIMIT 1",
+                    new String[]{String.valueOf(msgId)});
+            if (cursor == null || !Boolean.TRUE.equals(findNoArgMethod(cursor.getClass(), "moveToFirst").invoke(cursor))) {
+                return "";
+            }
+            return stringColumn(cursor, 0);
+        } catch (Throwable ignored) {
+            return "";
+        } finally {
+            closeQuietly(cursor);
+        }
+    }
+
+    private static String messageSourceForMessage(Object db, long msgId) {
+        if (db == null || msgId <= 0L) {
+            return "";
+        }
+        Object cursor = null;
+        try {
+            cursor = rawQuery(
+                    db,
+                    "SELECT COALESCE(msgSource,'') FROM message WHERE msgId=? LIMIT 1",
+                    new String[]{String.valueOf(msgId)});
+            if (cursor == null
+                    || !Boolean.TRUE.equals(findNoArgMethod(cursor.getClass(), "moveToFirst").invoke(cursor))) {
+                return "";
+            }
+            return stringColumn(cursor, 0);
+        } catch (Throwable ignored) {
+            return "";
+        } finally {
+            closeQuietly(cursor);
+        }
+    }
+
+    private static ImageInfoRecord queryImageInfoRecord(Object db, Long msgId, Long msgSvrId) {
+        if (db == null) {
+            return null;
+        }
+        if (msgSvrId != null && msgSvrId > 0L) {
+            ImageInfoRecord byServerId = queryImageInfoRecord(
+                    db,
+                    "msgSvrId=? ORDER BY CASE WHEN reserved1>0 THEN 0 ELSE 1 END, id ASC LIMIT 1",
+                    new String[]{String.valueOf(msgSvrId)});
+            if (byServerId != null && byServerId.id > 0L) {
+                return byServerId;
+            }
+        }
+        if (msgId != null && msgId > 0L) {
+            return queryImageInfoRecord(
+                    db,
+                    "msglocalid=? ORDER BY CASE WHEN reserved1>0 THEN 0 ELSE 1 END, id DESC LIMIT 1",
+                    new String[]{String.valueOf(msgId)});
+        }
+        return null;
+    }
+
+    private static ImageInfoRecord queryImageInfoRecordById(Object db, long imageInfoId) {
+        if (db == null || imageInfoId <= 0L) {
+            return null;
+        }
+        return queryImageInfoRecord(db, "id=? LIMIT 1", new String[]{String.valueOf(imageInfoId)});
+    }
+
+    private static ImageInfoRecord queryImageInfoRecord(Object db, String whereClause, String[] args) {
+        Object cursor = null;
+        try {
+            cursor = rawQuery(
+                    db,
+                    "SELECT id,reserved1,COALESCE(bigImgPath,''),COALESCE(midImgPath,''),"
+                            + "COALESCE(totalLen,0),COALESCE(offset,0) "
+                            + "FROM ImgInfo2 WHERE " + whereClause,
+                    args);
+            if (cursor == null) {
+                return null;
+            }
+            Method moveToFirst = findNoArgMethod(cursor.getClass(), "moveToFirst");
+            if (!Boolean.TRUE.equals(moveToFirst.invoke(cursor))) {
+                return null;
+            }
+            ImageInfoRecord record = new ImageInfoRecord();
+            record.id = longColumn(cursor, 0);
+            record.hdId = longColumn(cursor, 1);
+            record.bigPath = stringColumn(cursor, 2);
+            record.midPath = stringColumn(cursor, 3);
+            record.totalLen = intColumn(cursor, 4);
+            record.offset = intColumn(cursor, 5);
+            return record;
+        } catch (Throwable ignored) {
+            return null;
+        } finally {
+            closeQuietly(cursor);
+        }
     }
 
     private static String videoMediaHintFromInfoTable(Object db, Long msgId, Long msgSvrId) {
@@ -1622,6 +3023,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static String voiceMediaHintFromInfoTable(Object db, Long msgId, Long msgSvrId) {
+        String knownHint = voiceMediaHintFromKnownColumns(db, msgId, msgSvrId);
+        if (!isBlank(knownHint)) {
+            return knownHint;
+        }
         String[] tables = new String[]{"voiceinfo", "voiceinfo2"};
         for (String table : tables) {
             List<String> columns = tableColumns(db, table);
@@ -1650,6 +3055,30 @@ public final class HookEntry implements IXposedHookLoadPackage {
             for (String idColumn : idColumns) {
                 for (Long id : ids) {
                     String hint = queryMediaInfoHint(db, table, idColumn, id.longValue(), valueColumns);
+                    if (!isBlank(hint)) {
+                        return hint;
+                    }
+                }
+            }
+        }
+        return "";
+    }
+
+    private static String voiceMediaHintFromKnownColumns(Object db, Long msgId, Long msgSvrId) {
+        List<Long> ids = new ArrayList<>();
+        addPositiveId(ids, msgId);
+        addPositiveId(ids, msgSvrId);
+        String[] tables = new String[]{"voiceinfo", "voiceinfo2"};
+        String[] idColumns = new String[]{"MsgLocalId", "MsgId", "MsgSvrId"};
+        for (String table : tables) {
+            for (String idColumn : idColumns) {
+                for (Long id : ids) {
+                    String hint = queryMediaInfoHint(
+                            db,
+                            table,
+                            idColumn,
+                            id.longValue(),
+                            Collections.singletonList("FileName"));
                     if (!isBlank(hint)) {
                         return hint;
                     }
@@ -1779,7 +3208,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return null;
         }
         File direct = directMediaFile(mediaHint);
-        if (direct != null) {
+        if (direct != null && (type != 3 || !InboundImagePolicy.isThumbnailPath(direct.getName()))) {
             return direct;
         }
         Context context = APP_CONTEXT;
@@ -1816,7 +3245,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
             logEmojiInfoDiagnostic(emojiMd5);
         }
         if (type == 34) {
-            return findRecentVoiceFile(microMsgRoot, createTime);
+            // Never attach a globally recent voice file to a message. If the exact
+            // database-backed hint cannot be resolved, reporting no media is safer
+            // than leaking audio across chats or users.
+            return null;
         }
         if (type == 43 || type == 62) {
             return findMediaInProfileRoots(new File(appRoot, "cache"), videoCacheSearchRoots(), names);
@@ -1872,6 +3304,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static List<String> mediaCandidateNames(int type, String mediaHint) {
+        if (type == 3) {
+            return InboundImagePolicy.originalCandidateNames(mediaHint);
+        }
         List<String> names = new ArrayList<>();
         String normalized = normalizeMediaHint(mediaHint);
         addMediaCandidate(names, normalized);
@@ -1898,9 +3333,6 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return videoNames;
         }
         for (String candidate : snapshot) {
-            if (type == 3 && candidate.startsWith("th_") && candidate.length() > 3) {
-                addMediaCandidate(names, candidate.substring(3));
-            }
             if (type == 34) {
                 String base = stripKnownMediaExtension(candidate);
                 if (!base.equals(candidate)) {
@@ -2028,93 +3460,6 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return found;
         }
         return findNamedFile(new File(appRoot, "cache"), names, 4, new int[]{0});
-    }
-
-    private static File findRecentVoiceFile(File microMsgRoot, long createTimeSeconds) {
-        File[] profiles = microMsgRoot == null ? null : microMsgRoot.listFiles();
-        if (profiles == null) {
-            return null;
-        }
-        long now = System.currentTimeMillis();
-        long targetMs = createTimeSeconds > 0L ? createTimeSeconds * 1000L : now;
-        long minMs = Math.max(0L, targetMs - 10L * 60L * 1000L);
-        long maxMs = targetMs + 10L * 60L * 1000L;
-        RecentMediaCandidate best = new RecentMediaCandidate();
-        int[] visited = new int[]{0};
-        for (File profile : profiles) {
-            if (profile == null || !profile.isDirectory()) {
-                continue;
-            }
-            findRecentVoiceFile(new File(profile, "voice2"), minMs, maxMs, targetMs, 6, visited, best);
-        }
-        if (best.file != null) {
-            log("voice media fallback selected file=" + best.file.getName()
-                    + " size=" + best.file.length()
-                    + " modified=" + best.modifiedMs
-                    + " distanceMs=" + best.distanceMs);
-        }
-        return best.file;
-    }
-
-    private static void findRecentVoiceFile(
-            File root,
-            long minMs,
-            long maxMs,
-            long targetMs,
-            int depth,
-            int[] visited,
-            RecentMediaCandidate best) {
-        if (root == null || !root.isDirectory() || depth < 0 || visited[0] > 8000) {
-            return;
-        }
-        File[] files = root.listFiles();
-        if (files == null) {
-            return;
-        }
-        for (File file : files) {
-            if (file == null || !file.isFile()) {
-                continue;
-            }
-            visited[0]++;
-            if (!isLikelyVoiceMediaFile(file)) {
-                continue;
-            }
-            long modified = file.lastModified();
-            if (modified < minMs || modified > maxMs) {
-                continue;
-            }
-            long distance = Math.abs(modified - targetMs);
-            if (best.file == null
-                    || distance < best.distanceMs
-                    || (distance == best.distanceMs && modified > best.modifiedMs)) {
-                best.file = file;
-                best.distanceMs = distance;
-                best.modifiedMs = modified;
-            }
-        }
-        for (File file : files) {
-            if (file != null && file.isDirectory()) {
-                findRecentVoiceFile(file, minMs, maxMs, targetMs, depth - 1, visited, best);
-            }
-        }
-    }
-
-    private static boolean isLikelyVoiceMediaFile(File file) {
-        if (file == null || !file.isFile() || file.length() <= 0L) {
-            return false;
-        }
-        String name = file.getName() == null ? "" : file.getName().toLowerCase(Locale.US);
-        if (name.endsWith(".amr") || name.endsWith(".silk")) {
-            return true;
-        }
-        File parent = file.getParentFile();
-        while (parent != null) {
-            if ("voice2".equals(parent.getName())) {
-                return true;
-            }
-            parent = parent.getParentFile();
-        }
-        return false;
     }
 
     private static File findNamedFile(File root, List<String> names, int depth, int[] visited) {
@@ -2319,6 +3664,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 return "[位置]";
             case 49:
                 return "[链接/文件]";
+            case MESSAGE_TYPE_TRANSFER:
+                return "[转账]";
+            case MESSAGE_TYPE_RED_PACKET:
+                return "[红包]";
             case MESSAGE_TYPE_FILE_TRANSFER:
                 return "[文件]";
             case 50:
@@ -2346,7 +3695,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static String rawXmlPayload(String content, int type) {
-        if (type != 49 && type != 48 && type != 47 && type != 10000) {
+        if (type != 49 && type != 48 && type != 47 && type != 10000
+                && type != MESSAGE_TYPE_TRANSFER && type != MESSAGE_TYPE_RED_PACKET) {
             return "";
         }
         if (!looksLikeXmlPayload(content)) {
@@ -2357,6 +3707,47 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static String extractXmlField(String xml, String field) {
         return cleanDisplayText(extractXmlFieldRaw(xml, field), 120);
+    }
+
+    private static String xmlElementNames(String xml) {
+        if (isBlank(xml)) {
+            return "<empty>";
+        }
+        Set<String> names = new HashSet<>();
+        int from = 0;
+        while (from < xml.length() && names.size() < 48) {
+            int start = xml.indexOf('<', from);
+            if (start < 0 || start + 1 >= xml.length()) {
+                break;
+            }
+            int cursor = start + 1;
+            char marker = xml.charAt(cursor);
+            if (marker == '/' || marker == '?' || marker == '!') {
+                cursor++;
+            }
+            int nameStart = cursor;
+            while (cursor < xml.length()) {
+                char value = xml.charAt(cursor);
+                if (!(Character.isLetterOrDigit(value) || value == '_' || value == ':' || value == '-')) {
+                    break;
+                }
+                cursor++;
+            }
+            if (cursor > nameStart) {
+                names.add(xml.substring(nameStart, cursor).toLowerCase(Locale.US));
+            }
+            from = Math.max(cursor, start + 1);
+        }
+        List<String> sorted = new ArrayList<>(names);
+        Collections.sort(sorted);
+        StringBuilder result = new StringBuilder();
+        for (String name : sorted) {
+            if (result.length() > 0) {
+                result.append(',');
+            }
+            result.append(name);
+        }
+        return result.length() == 0 ? "<none>" : result.toString();
     }
 
     private static String extractXmlAttribute(String xml, String attribute) {
@@ -3287,6 +4678,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
         if (dispatchItem == null) {
             return SendResult.failed("outbox item is required");
         }
+        if ("transfer_accept".equals(dispatchItem.kind)) {
+            return sendTransferAcceptAction(config, classLoader, dispatchItem.item);
+        }
         if (isBlank(dispatchItem.wxid)) {
             return SendResult.failed("wxid is required");
         }
@@ -3331,6 +4725,347 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return sendChatHistoryAction(config, classLoader, dispatchItem.wxid, text, item);
         }
         return SendResult.failed("unsupported outbox kind: " + dispatchItem.kind);
+    }
+
+    private static SendResult sendTransferAcceptAction(BridgeConfig config, ClassLoader classLoader, JSONObject item) {
+        try {
+            JSONObject payload = item.optJSONObject("payload_json");
+            long sourceChatRecordId = firstPositiveLong(
+                    item.optLong("chat_record_id", 0L),
+                    item.optLong("source_chat_record_id", 0L),
+                    payload == null ? 0L : payload.optLong("chat_record_id", 0L),
+                    payload == null ? 0L : payload.optLong("source_chat_record_id", 0L));
+            if (sourceChatRecordId <= 0L) {
+                return SendResult.failed("chat_record_id is required");
+            }
+            Object db = ensureMessageDatabase(config);
+            if (db == null) {
+                return SendResult.failed("WeChat message database is not available for transfer lookup");
+            }
+            ChatHistorySource source = loadChatHistorySource(db, sourceChatRecordId);
+            if (source == null) {
+                return SendResult.failed("source transfer message was not found in local WeChat message database");
+            }
+            if (source.isSend != 0) {
+                return SendResult.failed("source_chat_record_id must be an inbound transfer");
+            }
+            String transferXML = normalizeMessageContent(source.talker, source.content, source.type);
+            TransferMessageParser.Result transfer = TransferMessageParser.parse(transferXML);
+            boolean transferType = source.type == MESSAGE_TYPE_TRANSFER
+                    || (source.type == MESSAGE_TYPE_APPMSG && transfer.appMsgType == TransferMessageParser.APPMSG_TYPE_TRANSFER);
+            if (!transferType || !transfer.isTransfer()) {
+                return SendResult.failed("source_chat_record_id is not a transfer message");
+            }
+            if (!transfer.isPending()) {
+                return SendResult.failed("transfer is not pending: " + transfer.state);
+            }
+            if (!transfer.hasConfirmFields()) {
+                log("transfer confirm fields missing xmlLength=" + transferXML.length()
+                        + " tags=" + xmlElementNames(transferXML));
+                return SendResult.failed("transfer message is missing confirm identifiers or amount");
+            }
+            String groupUsername = isChatroomTalker(source.talker) ? source.talker : "";
+            String sourceSender = isBlank(groupUsername) ? source.talker : extractChatroomSender(source.content);
+            if (isBlank(sourceSender)) {
+                return SendResult.failed("transfer sender cannot be resolved from the source message");
+            }
+            if (!isBlank(transfer.payerWxid) && !sourceSender.equals(transfer.payerWxid)) {
+                return SendResult.failed("transfer payer does not match the source message sender");
+            }
+            String currentWxid = firstNonBlank(CURRENT_WXID, config == null ? "" : config.selfWxid);
+            if (!isBlank(transfer.receiverWxid) && !isBlank(currentWxid) && !currentWxid.equals(transfer.receiverWxid)) {
+                return SendResult.failed("transfer receiver does not match the current WeChat account");
+            }
+            return confirmTransfer(classLoader, sourceChatRecordId, sourceSender, groupUsername, transfer);
+        } catch (Throwable t) {
+            log("transfer diag: accept failed: " + fullErrorChain(t));
+            return SendResult.failed("transfer accept failed: " + shortError(t));
+        }
+    }
+
+    private static SendResult confirmTransfer(
+            ClassLoader classLoader,
+            long sourceChatRecordId,
+            String sourceSender,
+            String groupUsername,
+            TransferMessageParser.Result transfer) throws Exception {
+        // z2/m1's Kernel-readiness state is per-ClassLoader; WeChat's Tinker hot-patch
+        // loads a second copy of these classes under a different loader (see
+        // runtimeClassLoader()'s isPatchedWeChatLoader preference). Resolving here,
+        // before any class in this flow gets touched, keeps confirmTransfer/
+        // queryTransferStatus/enqueueNetScene all on the same (patched) loader that
+        // sendViaNetScene already uses successfully for text.
+        classLoader = runtimeClassLoader(classLoader);
+        ensureWeChatRegistriesForTransfer(classLoader);
+        probeTransferClassChain(classLoader);
+        int initialStatus = 0;
+        try {
+            initialStatus = queryTransferStatus(classLoader, transfer, groupUsername, 1, 10L);
+        } catch (Throwable t) {
+            log("transfer pre-confirm query unavailable: " + fullErrorChain(t));
+        }
+        if (initialStatus == 2001) {
+            log("transfer already accepted before confirm source_chat_record_id=" + sourceChatRecordId);
+            return SendResult.sent(sourceChatRecordId);
+        }
+        if (isTerminalTransferStatus(initialStatus)) {
+            return SendResult.failed("transfer is no longer receivable: status=" + initialStatus);
+        }
+        Class<?> confirmClass = findClass(classLoader, "com.tencent.mm.plugin.remittance.model.n0");
+        ensureTransferCallbackHook(confirmClass, TRANSFER_CONFIRM_CALLBACK_HOOKED, TRANSFER_CONFIRM_WAITERS);
+        Constructor<?> confirmConstructor = findConstructor(
+                confirmClass,
+                String.class,
+                String.class,
+                int.class,
+                String.class,
+                String.class,
+                int.class,
+                String.class,
+                int.class,
+                String.class,
+                Map.class,
+                long.class,
+                String.class,
+                String.class);
+        Object confirmScene = newTransferScene(
+                confirmConstructor,
+                transfer.transactionId,
+                transfer.transferId,
+                (int) transfer.amountMinor,
+                "confirm",
+                sourceSender,
+                transfer.invalidTime,
+                groupUsername,
+                1,
+                "",
+                null,
+                0L,
+                sourceSender,
+                transfer.attach);
+        NetworkResultWaiter confirmWaiter = new NetworkResultWaiter();
+        TRANSFER_CONFIRM_WAITERS.put(confirmScene, confirmWaiter);
+        try {
+            setNetSceneProcessName(confirmScene, "RemittanceProcess");
+            enqueueNetScene(classLoader, confirmScene);
+            if (!confirmWaiter.await(20L)) {
+                log("transfer confirm callback timed out; verifying with transfer query");
+            } else if (confirmWaiter.code != 0) {
+                return SendResult.failed("transfer confirm rejected: code=" + confirmWaiter.code + " " + confirmWaiter.message);
+            }
+        } finally {
+            TRANSFER_CONFIRM_WAITERS.remove(confirmScene);
+        }
+
+        int status = queryTransferStatus(classLoader, transfer, groupUsername);
+        if (status == 2001) {
+            log("transfer accepted source_chat_record_id=" + sourceChatRecordId
+                    + " amount_minor=" + transfer.amountMinor
+                    + " currency=" + transfer.currency);
+            return SendResult.sent(sourceChatRecordId);
+        }
+        return SendResult.failed("transfer confirm was not verified as received: status=" + status);
+    }
+
+    /**
+     * The transfer confirm/query path never went through {@link #isWeChatReadyForSend},
+     * so unlike the text-send path it never triggered the module's existing
+     * MMApplicationContext (x2.a) recovery. Root cause per handoff doc 13.26:
+     * com.tencent.mm.wallet_core.tenpay.model.o's static init eventually calls
+     * x2.a.getString(...), and if x2.a is still null on this device the resulting
+     * NullPointerException permanently marks o (and its subclasses n0/h1) erroneous
+     * for the process. Reuses the existing, already-proven recovery logic instead of
+     * writing new speculative code.
+     */
+    private static void ensureWeChatRegistriesForTransfer(ClassLoader classLoader) {
+        try {
+            classLoader = runtimeClassLoader(classLoader);
+            ensureWeChatBuildInfo(APP_CONTEXT, classLoader);
+            ensureWeChatRegistries(classLoader, weChatSymbols(classLoader));
+            ensureWalletPluginInitialized(classLoader);
+            ensureTenpaySignFallbackHook(classLoader);
+        } catch (Throwable t) {
+            log("transfer diag: ensureWeChatRegistries failed: " + fullErrorChain(t));
+        }
+    }
+
+    /**
+     * Diagnostic-only: forces class init on the transfer NetScene base chain,
+     * ancestor first, so a class already marked erroneous on this device (from
+     * some earlier, unrelated touch) reports its ORIGINAL failure here instead
+     * of the generic "sub-type of erroneous class" message the eventual
+     * confirmConstructor.newInstance() call would surface. Never throws, never
+     * changes the accept flow's return value.
+     */
+    private static void probeTransferClassChain(ClassLoader classLoader) {
+        String[] chain = {
+                "com.tencent.mm.modelbase.m1",
+                "com.tencent.mm.wallet_core.model.d1",
+                "com.tencent.mm.wallet_core.model.z0",
+                "com.tencent.mm.wallet_core.tenpay.model.o",
+        };
+        for (String className : chain) {
+            try {
+                Class.forName(className, true, classLoader);
+            } catch (Throwable t) {
+                log("transfer diag: class init failed at " + className + ": " + fullErrorChain(t));
+                return;
+            }
+        }
+        log("transfer diag: transfer base class chain initialized OK");
+    }
+
+    private static int queryTransferStatus(
+            ClassLoader classLoader,
+            TransferMessageParser.Result transfer,
+            String groupUsername) throws Exception {
+        return queryTransferStatus(classLoader, transfer, groupUsername, 3, 20L);
+    }
+
+    private static int queryTransferStatus(
+            ClassLoader classLoader,
+            TransferMessageParser.Result transfer,
+            String groupUsername,
+            int maxAttempts,
+            long timeoutSeconds) throws Exception {
+        ensureWeChatRegistriesForTransfer(classLoader);
+        Class<?> queryClass = findClass(classLoader, "com.tencent.mm.plugin.remittance.model.h1");
+        ensureTransferCallbackHook(queryClass, TRANSFER_QUERY_CALLBACK_HOOKED, TRANSFER_QUERY_WAITERS);
+        Constructor<?> queryConstructor = findConstructor(
+                queryClass,
+                int.class,
+                String.class,
+                String.class,
+                int.class,
+                String.class,
+                String.class);
+        int lastStatus = 0;
+        boolean responseObserved = false;
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
+            Object queryScene = newTransferScene(
+                    queryConstructor,
+                    1,
+                    transfer.transactionId,
+                    transfer.transferId,
+                    transfer.invalidTime,
+                    groupUsername,
+                    transfer.attach);
+            NetworkResultWaiter queryWaiter = new NetworkResultWaiter();
+            TRANSFER_QUERY_WAITERS.put(queryScene, queryWaiter);
+            try {
+                setNetSceneProcessName(queryScene, "RemittanceProcess");
+                enqueueNetScene(classLoader, queryScene);
+                long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(timeoutSeconds);
+                while (System.currentTimeMillis() < deadline) {
+                    lastStatus = (int) getLongField(queryScene, "h");
+                    if (lastStatus != 0) {
+                        responseObserved = true;
+                        break;
+                    }
+                    if (queryWaiter.isComplete()) {
+                        responseObserved = true;
+                        if (queryWaiter.code != 0) {
+                            throw new IllegalStateException("transfer status query rejected: code="
+                                    + queryWaiter.code + " " + queryWaiter.message);
+                        }
+                    }
+                    Thread.sleep(250L);
+                }
+                if (queryWaiter.isComplete() && queryWaiter.code != 0) {
+                    throw new IllegalStateException("transfer status query rejected: code="
+                            + queryWaiter.code + " " + queryWaiter.message);
+                }
+                lastStatus = (int) getLongField(queryScene, "h");
+            } finally {
+                TRANSFER_QUERY_WAITERS.remove(queryScene);
+            }
+            if (isTerminalTransferStatus(lastStatus)) {
+                return lastStatus;
+            }
+            Thread.sleep(750L);
+        }
+        if (!responseObserved && lastStatus == 0) {
+            throw new IllegalStateException("transfer status query timed out");
+        }
+        return lastStatus;
+    }
+
+    private static boolean isTerminalTransferStatus(int status) {
+        return status == 2001 || status == 2002 || status == 2003
+                || status == 2004 || status == 2005;
+    }
+
+    private static void ensureTransferCallbackHook(
+            Class<?> sceneClass,
+            AtomicBoolean hooked,
+            final ConcurrentHashMap<Object, NetworkResultWaiter> waiters) {
+        if (!hooked.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            XposedBridge.hookAllMethods(sceneClass, "onGYNetEnd", new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    NetworkResultWaiter waiter = waiters.get(param.thisObject);
+                    if (waiter != null) {
+                        waiter.complete(param.args);
+                    }
+                }
+            });
+        } catch (Throwable t) {
+            hooked.set(false);
+            throw new IllegalStateException("hook transfer callback failed", t);
+        }
+    }
+
+    private static void setNetSceneProcessName(Object scene, String processName) {
+        try {
+            findMethod(scene.getClass(), "setProcessName", String.class).invoke(scene, processName);
+        } catch (Throwable t) {
+            log("set transfer NetScene process name skipped: " + shortError(t));
+        }
+    }
+
+    /**
+     * Per handoff doc 13.31.5: ho0.j1.e() depends on a Kernel singleton (ho0.j1.m)
+     * that is null in this dual-instance process/classloader, causing "Kernel not
+     * initialized by MMApplication!" at enqueue time. 13.32/13.33 switched to
+     * com.tencent.mm.modelbase.z2.b(scene) to reuse the entry point sendViaNetScene
+     * uses for text -- but per doc 13.36, dexdump of z2.b(m1) shows it forwards to
+     * com.tencent.mm.modelbase.r1.d(m1), which is NOT an enqueue method, it is
+     * CANCEL (logs "cancel sceneHashCode:%d", calls scene.cancel(), removes it from
+     * the running/pending vectors). Every z2.b() call was silently self-cancelling
+     * the request before it ever reached the network -- that is why nothing showed
+     * up in RunCgi/network logs and every wait timed out. The real enqueue method is
+     * r1.h(m1, int) (r1.g(m1) is a same-class convenience wrapper for h(scene, 0)),
+     * on the SAME r1 instance z2 already holds a working reference to (confirmed
+     * non-null by z2.c()==true): z2's static field b (a ho0.n) -> field a (a ho0.y)
+     * -> field b (the com.tencent.mm.modelbase.r1 NetSceneQueue). Reach that same r1
+     * instance directly and call the real .h(scene, 0) on it, instead of z2.b().
+     */
+    private static void enqueueNetScene(ClassLoader classLoader, Object scene) throws Exception {
+        Class<?> runCgi = findClass(classLoader, "com.tencent.mm.modelbase.z2");
+        Object queueHandle = findField(runCgi, "b").get(null);
+        if (queueHandle == null) {
+            throw new IllegalStateException("NetSceneQueue is not ready");
+        }
+        Object y = findField(queueHandle.getClass(), "a").get(queueHandle);
+        if (y == null) {
+            throw new IllegalStateException("NetSceneQueue handle is incomplete");
+        }
+        Object netSceneQueue = findField(y.getClass(), "b").get(y);
+        if (netSceneQueue == null) {
+            throw new IllegalStateException("NetSceneQueue is not ready");
+        }
+        Method enqueue = findMethod(
+                netSceneQueue.getClass(),
+                "h",
+                findClass(classLoader, "com.tencent.mm.modelbase.m1"),
+                int.class);
+        Object accepted = enqueue.invoke(netSceneQueue, scene, 0);
+        if (accepted instanceof Boolean && !((Boolean) accepted)) {
+            throw new IllegalStateException("NetSceneQueue rejected transfer request");
+        }
     }
 
     private static String outboxKind(JSONObject item) {
@@ -6604,6 +8339,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return ((Number) value).longValue();
         }
         return Long.parseLong(String.valueOf(value));
+    }
+
+    private static String getStringField(Object target, String... names) throws Exception {
+        Field field = findFieldAny(target.getClass(), names);
+        Object value = field.get(target);
+        return value == null ? "" : String.valueOf(value);
     }
 
     private static String joinNames(String... names) {

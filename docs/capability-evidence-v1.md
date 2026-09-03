@@ -15,8 +15,8 @@ payment details.
   documented scope.
 - Failed samples are not deleted from the ledger. They prove unsupported or
   incomplete payloads return explicit failures instead of silently succeeding.
-- Payment, red packet, transfer, and system capabilities are intentionally
-  inbound-only or parse-only in v1.
+- Red packet and system capabilities remain inbound-only. Transfer acceptance
+  is narrowly source-bound and never accepts caller-supplied amount or transaction identifiers.
 
 ## Current Runtime Surface
 
@@ -33,7 +33,8 @@ payment details.
 | `link` | `/api/v1/messages/link` | `structured` | `stable` | `db_verified` |
 | `mini_program` | `/api/v1/messages/mini-program` | `structured` | `source_forward_stable` | `db_verified` |
 | `chat_history` | `/api/v1/messages/chat-history` | `basic` | `source_forward_only` | `sample_only` |
-| `payment` | none | `parse_only` | `unsupported` | `sample_only` |
+| `payment.transfer` | `/api/v1/transfers/accept` | `structured` | `experimental` | `static` |
+| `payment.red_packet` | none | `parse_only` | `unsupported` | `sample_only` |
 | `system` | none | `parse_only` | `non_goal` | `parse_only` |
 | `unknown-business` | none | `preserved` | `unsupported` | `sample_only` |
 
@@ -52,6 +53,7 @@ payment details.
 | `link` | `3 / 0` | `62` | `chat_record_id=9577`, `message.type=49`, appmsg `5` | DB-verified typed builder and source-compatible schema. |
 | `mini_program` | `4 / 0` | `72` | `chat_record_id=9628`, `message.type=49`, appmsg `33` | Source forwarding is stable; direct construction still needs real username/page/icon samples. |
 | `chat_history` | `6 / 0` | `44` | `chat_record_id=8269`, `message.type=49`, appmsg `19` | Source/original forwarding works; nested record summary is not normalized enough for stable. |
+| `transfer_accept` | `0 / 0` | none | WeChat 8.0.77 static chain: `transferoperation` func 1691 followed by `transferquery` func 1628; success requires status `2001` | Implementation and safe-failure tests are required before a live pending transfer is used. |
 
 ## Inbound Evidence Snapshot
 
@@ -68,7 +70,8 @@ payment details.
 | `link` | `message.type=49`, appmsg `5` | `25` normalized rows | Structured appmsg parser. |
 | `mini_program` | `message.type=49`, appmsg `33/36` | `23` normalized rows | Structured appmsg parser. |
 | `chat_history` | `message.type=49`, appmsg `19` | `44` normalized rows | Basic nested record parsing; summary normalization incomplete. |
-| `payment` | high-bit payment-like types `419430449`, `436207665` observed; payment fixtures cover appmsg `2000/2001` | `5` high-bit rows observed in current DB | Parse-only by design; no outbound automation. |
+| `payment.transfer` | high-bit type `419430449`; parser covers `wcpayinfo` appmsg `2000`, amount, currency, payer/receiver and state | Existing high-bit samples plus static fixtures | Structured fields are persisted; public output omits operational transfer identifiers and raw XML. |
+| `payment.red_packet` | high-bit type `436207665`; appmsg `2001` fixture | Existing high-bit samples | Parse-only and redacted; no outbound automation. |
 | `system` | `message.type=10000` | `4` normalized rows plus older raw rows | Parse-only/non-goal unless state sync requires it. |
 | `unknown-business` | high-bit/custom types including `42`, `570425393`, `754974769`, `922746929`, `1140850737` | `27` normalized rows | Preserved with raw type evidence until safely classified. |
 
@@ -89,5 +92,6 @@ payment details.
 - `mini_program`: source forwarding is stable; direct field construction still needs known username/page/icon samples.
 - `quote`: group quote and incomplete metadata behavior need a tighter compatibility matrix.
 - `chat_history`: nested record summaries should be normalized before calling it stable.
-- `payment`: keep parse-only and redacted; outbound remains unsupported.
+- `payment.transfer`: complete live validation with a deliberately created pending transfer; keep acceptance source-bound.
+- `payment.red_packet`: keep parse-only and redacted; outbound remains unsupported.
 - `unknown-business`: classify only after safe, redacted sample review.

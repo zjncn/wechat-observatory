@@ -113,6 +113,45 @@ curl -H "X-Bridge-Password: your-admin-password" \
 | `wxid` | 对话对象或群聊 ID |
 | `limit` | 返回数量 |
 
+转账消息会归一化为 `kind=payment`、`subtype=transfer`，并返回公开的
+`payment` 结构。金额统一使用最小货币单位，例如 CNY 的 `amount_minor=1234`
+表示 12.34 元。公开信封不会返回原始 XML、`transaction_id` 或
+`transfer_id`：
+
+```json
+{
+  "chat_record_id": 123456,
+  "kind": "payment",
+  "subtype": "transfer",
+  "text": "[转账]",
+  "payment": {
+    "type": "transfer",
+    "state": "pending",
+    "amount_minor": 1234,
+    "currency": "CNY",
+    "display_amount": "￥12.34",
+    "memo": "<memo>"
+  }
+}
+```
+
+## 收取转账
+
+```bash
+curl -X POST \
+  -H "X-Bridge-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"chat_record_id":123456}' \
+  http://127.0.0.1:8088/api/v1/transfers/accept
+```
+
+该接口只接受本机原始入站消息的 `chat_record_id`，不接收 `wx_ids`、金额或
+交易号。手机模块会重新读取微信本地消息并依次校验：消息确为转账、当前仍为
+待收状态、金额有效、付款人与原消息一致、收款人为当前登录账号。确认请求后还
+会调用微信的转账查询接口，只有 `trans_status=2001` 才把 outbox ACK 为
+`sent`；其他状态和超时都返回 `failed`。首次 HTTP 200 只表示任务已入队，
+请继续查询响应里的 `status_url`。
+
 ## 管理端发送接口
 
 ```bash
@@ -135,7 +174,8 @@ curl -X POST \
   http://127.0.0.1:8088/api/send/action
 ```
 
-外部系统不要依赖管理密码接口，推荐使用 `/api/v1/messages/{kind}` 和 `/api/v1/outbox/{id}`。
+外部系统不要依赖管理密码接口，推荐使用 `/api/v1/messages/{kind}`、
+`/api/v1/transfers/accept` 和 `/api/v1/outbox/{id}`。
 
 ## 实时事件
 

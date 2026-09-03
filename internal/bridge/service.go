@@ -704,6 +704,13 @@ func (s *Service) AckOutbox(ctx context.Context, req ModuleAckRequest) ([]Module
 		if ack.Status != "sent" {
 			continue
 		}
+		if isTransferAcceptOutboxItem(item) {
+			if ack.ChatRecordID > 0 && s.persistence != nil {
+				ownerWxID := firstNonEmpty(item.OwnerWxID, s.deviceWxID(item.Device))
+				_ = s.persistence.MarkTransferReceived(ctx, item.Device, ownerWxID, ack.ChatRecordID)
+			}
+			continue
+		}
 		if isRevokeOutboxItem(item) {
 			continue
 		}
@@ -1121,6 +1128,10 @@ func isLinkOutboxItem(item ModuleOutboxItem) bool {
 
 func isRevokeOutboxItem(item ModuleOutboxItem) bool {
 	return item.Kind == OutboxKindRevoke
+}
+
+func isTransferAcceptOutboxItem(item ModuleOutboxItem) bool {
+	return item.Kind == OutboxKindTransferAccept
 }
 
 func isMiniProgramOutboxItem(item ModuleOutboxItem) bool {

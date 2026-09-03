@@ -1,8 +1,9 @@
 {
   "adapter_notes": [
-    "红包和转账只做入站识别与脱敏；v1 不提供出站自动化。"
+    "转账金额使用最小货币单位；收款只能提交原消息 chat_record_id。",
+    "公开信封不返回 transaction_id、transfer_id 或 raw XML；红包仍不提供领取自动化。"
   ],
-  "capability_status": "parse_only",
+  "capability_status": "structured_experimental",
   "fixture_id": "public-api-v1.payment",
   "inbound_envelope": {
     "appmsg_type": 2000,
@@ -16,35 +17,44 @@
     "event_id": 10001,
     "evidence": [
       "message.type=419430449",
-      "payment.parse_only"
+      "payment.transfer.structured"
     ],
     "from_wxid": "<peer>",
     "id": "<message_id>",
     "kind": "payment",
     "message_type": 419430449,
     "owner_wxid": "<owner>",
+    "payment": {
+      "amount_minor": 1234,
+      "currency": "CNY",
+      "display_amount": "￥12.34",
+      "memo": "<memo>",
+      "pay_subtype": 1,
+      "state": "pending",
+      "type": "transfer"
+    },
     "subtype": "transfer",
     "text": "[转账]",
-    "to_wxid": "<owner>",
-    "unsupported": [
-      "payment_outbound_unsupported",
-      "payment_sensitive_fields_redacted"
-    ]
+    "to_wxid": "<owner>"
   },
   "kind": "payment",
-  "outbound_supported": false,
+  "outbound_request": {
+    "chat_record_id": 90001
+  },
+  "outbound_endpoint": "/api/v1/transfers/accept",
+  "outbound_supported": true,
   "placeholders": {
     "<conversation>": "Stable chat id; use this for routing, never display name.",
     "<device>": "Bridge device name bound to the API key.",
+    "<memo>": "Synthetic transfer memo.",
     "<owner>": "Current WeChat account on that device.",
     "<peer>": "Other direct-chat participant.",
     "<room>": "Group room id.",
     "<target>": "Friend wxid or room id supplied by the caller."
   },
   "protocol_version": "v1",
-  "title": "支付类消息只读识别",
+  "title": "转账结构化识别与源消息收款",
   "unsupported": [
-    "payment_outbound_unsupported",
-    "payment_sensitive_fields_redacted"
+    "red_packet_outbound_unsupported"
   ]
 }

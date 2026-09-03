@@ -97,6 +97,9 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 	if err := s.ensureMessageEventAppMsgColumns(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureMessageEventPaymentColumn(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureMessageEventLocationColumns(ctx); err != nil {
 		return err
 	}
@@ -194,6 +197,14 @@ func (s *Store) ensureMessageEventLocationColumns(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (s *Store) ensureMessageEventPaymentColumn(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE bridge_message_events ADD COLUMN payment JSON NULL AFTER evidence`)
+	if err == nil || strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return nil
+	}
+	return err
 }
 
 func (s *Store) ensureMessageEventOwnerColumns(ctx context.Context) error {
@@ -337,6 +348,7 @@ func Migrations() []string {
 				appmsg_app_name VARCHAR(255) NULL,
 				unsupported JSON NULL,
 				evidence JSON NULL,
+				payment JSON NULL,
 				location_latitude DOUBLE NULL,
 				location_longitude DOUBLE NULL,
 				location_scale INT NULL,
@@ -528,6 +540,27 @@ func (s *Store) RecordOutboundEvent(ctx context.Context, event bridge.MessageEve
 	return s.recordMessageEvent(ctx, event)
 }
 
+// MarkTransferReceived updates the stored payment.state (and receive_status,
+// kept consistent with bridge.paymentState's receiveStatus==3 case) for the
+// source inbound transfer message once its transfer_accept outbox item has
+// been ACKed sent. The stored payment JSON is otherwise only computed once at
+// ingestion time from the original XML, so without this it never reflects a
+// later successful accept.
+const markTransferReceivedStatement = `
+	UPDATE bridge_message_events
+	SET payment = JSON_SET(payment, '$.state', 'received', '$.receive_status', 3)
+	WHERE device = ?
+		AND owner_wxid <=> ?
+		AND direction = 'recv'
+		AND chat_record_id = ?
+		AND payment IS NOT NULL
+	LIMIT 1`
+
+func (s *Store) MarkTransferReceived(ctx context.Context, device string, ownerWxID string, chatRecordID int64) error {
+	_, err := s.db.ExecContext(ctx, markTransferReceivedStatement, device, nullString(ownerWxID), chatRecordID)
+	return err
+}
+
 const messageEventDedupUpdateStatement = `
 	UPDATE bridge_message_events
 	SET
@@ -549,6 +582,7 @@ const messageEventDedupUpdateStatement = `
 			appmsg_app_name = COALESCE(?, appmsg_app_name),
 			unsupported = COALESCE(?, unsupported),
 			evidence = COALESCE(?, evidence),
+			payment = COALESCE(?, payment),
 			location_latitude = COALESCE(?, location_latitude),
 			location_longitude = COALESCE(?, location_longitude),
 			location_scale = CASE WHEN ? > 0 THEN ? ELSE location_scale END,
@@ -970,12 +1004,12 @@ func (s *Store) recordMessageEvent(ctx context.Context, event bridge.MessageEven
 				source_id, event_id, chat_record_id, device, owner_wxid, direction, from_wxid,
 				to_wxid, room_id, sender_wxid, text, message_type, message_kind,
 				appmsg_type, appmsg_subtype, appmsg_title, appmsg_description, appmsg_url,
-				appmsg_file_name, appmsg_app_name, unsupported, evidence, location_latitude,
+				appmsg_file_name, appmsg_app_name, unsupported, evidence, payment, location_latitude,
 				location_longitude, location_scale, location_label, location_poiname,
 				location_info_url, location_poi_id, location_from_poi_list,
 				location_poi_category_tips, media_kind, media_mime, media_name,
 				media_url, media_size, raw_provider, create_time
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		nullString(event.ID),
 		nullInt64(event.EventID),
 		nullInt64(event.ChatRecordID),
@@ -998,6 +1032,7 @@ func (s *Store) recordMessageEvent(ctx context.Context, event bridge.MessageEven
 		nullString(event.AppMsgAppName),
 		nullStringSliceJSON(event.Unsupported),
 		nullStringSliceJSON(event.Evidence),
+		nullPaymentJSON(event.Payment),
 		nullFloat64Ptr(event.LocationLatitude),
 		nullFloat64Ptr(event.LocationLongitude),
 		nullInt64(int64(event.LocationScale)),
@@ -1039,6 +1074,7 @@ func (s *Store) updateMessageEventByChatRecordID(ctx context.Context, event brid
 		nullString(event.AppMsgAppName),
 		nullStringSliceJSON(event.Unsupported),
 		nullStringSliceJSON(event.Evidence),
+		nullPaymentJSON(event.Payment),
 		nullFloat64Ptr(event.LocationLatitude),
 		nullFloat64Ptr(event.LocationLongitude),
 		event.LocationScale, event.LocationScale,
@@ -1308,6 +1344,17 @@ func nullStringSliceJSON(values []string) sql.NullString {
 		return sql.NullString{}
 	}
 	data, err := json.Marshal(cleaned)
+	if err != nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: string(data), Valid: true}
+}
+
+func nullPaymentJSON(value *bridge.PaymentInfo) sql.NullString {
+	if value == nil {
+		return sql.NullString{}
+	}
+	data, err := json.Marshal(value)
 	if err != nil {
 		return sql.NullString{}
 	}

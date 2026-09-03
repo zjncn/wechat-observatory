@@ -148,10 +148,12 @@ aliases behind one runtime-selected profile instead of scattering version
 checks through Action Outbox dispatch.
 
 Action Outbox v1 dispatches `text`, `image`, `video`, `voice`, `file`, `emoji`,
-`location`, `quote`, `link`, `mini_program`, and `chat_history` from the gateway
+`location`, `quote`, `link`, `mini_program`, `chat_history`, and source-bound
+`transfer_accept` actions from the gateway
 queue. Unsupported or malformed kinds must ACK `failed` instead of being
-silently skipped. Payment-like and system-only message types are observation
-boundaries, not send actions.
+silently skipped. Transfer acceptance re-reads the local source message and
+ACKs success only after WeChat's transfer query reports received; red packets
+and system-only message types remain observation boundaries.
 
 On supported WeChat Android builds, the installed app can run through Tinker. The send
 adapter must resolve WeChat classes with the patched runtime loader returned by

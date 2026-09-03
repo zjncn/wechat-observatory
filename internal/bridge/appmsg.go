@@ -48,6 +48,23 @@ type appMsgXML struct {
 	AppAttach         appMsgAttachXML `xml:"appattach"`
 	WeAppInfo         appMsgWeAppXML  `xml:"weappinfo"`
 	RecordItem        string          `xml:"recorditem"`
+	WCPayInfo         paymentXML      `xml:"wcpayinfo"`
+}
+
+type paymentXML struct {
+	PaySubtype    string `xml:"paysubtype"`
+	DisplayAmount string `xml:"feedesc"`
+	TransactionID string `xml:"transcationid"`
+	TransferID    string `xml:"transferid"`
+	InvalidTime   string `xml:"invalidtime"`
+	EffectiveDate string `xml:"effectivedate"`
+	AmountMinor   string `xml:"total_fee"`
+	Currency      string `xml:"fee_type"`
+	Memo          string `xml:"pay_memo"`
+	PayerWxID     string `xml:"payer_username"`
+	ReceiverWxID  string `xml:"receiver_username"`
+	ReceiveStatus string `xml:"receivestatus"`
+	Attach        string `xml:"attach"`
 }
 
 type appMsgAttachXML struct {
@@ -202,6 +219,7 @@ func normalizeMessageEnvelope(event MessageEvent) MessageEvent {
 	event.Evidence = appendUnique(event.Evidence, "raw_xml.appmsg.type="+strconv.FormatInt(int64(parsed.Type), 10))
 	event.Evidence = appendUnique(event.Evidence, appMsgStructuralEvidence(parsed)...)
 	if event.MessageKind == MessageKindPayment {
+		event.Payment = paymentInfoFromXML(parsed.WCPayInfo)
 		return normalizePaymentAppMsg(event)
 	}
 	if event.AppMsgSubtype == "chat_history" && strings.TrimSpace(parsed.RecordItem) != "" {
@@ -351,14 +369,24 @@ func normalizeLocationMessage(event MessageEvent) MessageEvent {
 func normalizePaymentAppMsg(event MessageEvent) MessageEvent {
 	event.MessageKind = MessageKindPayment
 	event.MediaKind = ""
+	rawXML := strings.TrimSpace(firstNonEmpty(event.RawXML, xmlCandidateFromText(event.Text)))
+	if event.Payment == nil && rawXML != "" {
+		if parsed, ok := parseAppMsgXML(rawXML); ok {
+			if event.AppMsgType == 0 {
+				event.AppMsgType = parsed.Type
+			}
+			event.Payment = paymentInfoFromXML(parsed.WCPayInfo)
+			event.Evidence = appendUnique(event.Evidence, "raw_xml.appmsg.wcpayinfo")
+		} else {
+			event.Unsupported = appendUnique(event.Unsupported, "payment_xml_parse_failed")
+		}
+	}
 	event.RawXML = ""
 	event.AppMsgTitle = ""
 	event.AppMsgDescription = ""
 	event.AppMsgURL = ""
 	event.AppMsgFileName = ""
 	event.AppMsgAppName = ""
-	event.Unsupported = appendUnique(event.Unsupported, "payment_outbound_unsupported", "payment_sensitive_fields_redacted")
-	event.Evidence = appendUnique(event.Evidence, "payment.parse_only")
 	if event.MessageType > 0 {
 		event.Evidence = appendUnique(event.Evidence, "message.type="+strconv.FormatInt(int64(event.MessageType), 10))
 	}
@@ -368,12 +396,118 @@ func normalizePaymentAppMsg(event MessageEvent) MessageEvent {
 	switch event.AppMsgSubtype {
 	case "transfer":
 		event.Text = "[转账]"
+		if event.Payment == nil || event.Payment.TransferID == "" || event.Payment.TransactionID == "" {
+			event.Unsupported = appendUnique(event.Unsupported, "transfer_fields_missing")
+			event.Evidence = appendUnique(event.Evidence, "payment.transfer.partial")
+		} else {
+			event.Evidence = appendUnique(event.Evidence, "payment.transfer.structured")
+		}
 	case "red_packet":
 		event.Text = "[红包]"
+		event.Unsupported = appendUnique(event.Unsupported, "red_packet_outbound_unsupported", "red_packet_sensitive_fields_redacted")
+		event.Evidence = appendUnique(event.Evidence, "payment.red_packet.parse_only")
 	default:
 		event.Text = "[支付]"
+		event.Unsupported = appendUnique(event.Unsupported, "payment_outbound_unsupported")
+		event.Evidence = appendUnique(event.Evidence, "payment.parse_only")
 	}
 	return event
+}
+
+func paymentInfoFromXML(value paymentXML) *PaymentInfo {
+	amountMinor, _ := strconv.ParseInt(strings.TrimSpace(value.AmountMinor), 10, 64)
+	currency := compactSpace(value.Currency)
+	if amountMinor <= 0 {
+		amountMinor = parseCNYDisplayAmountMinor(value.DisplayAmount)
+		if amountMinor > 0 && currency == "" {
+			currency = "CNY"
+		}
+	}
+	invalidTime, _ := strconv.Atoi(strings.TrimSpace(value.InvalidTime))
+	effectiveDate, _ := strconv.Atoi(strings.TrimSpace(value.EffectiveDate))
+	receiveStatus, _ := strconv.Atoi(strings.TrimSpace(value.ReceiveStatus))
+	paySubtype, _ := strconv.Atoi(strings.TrimSpace(value.PaySubtype))
+	info := &PaymentInfo{
+		Type:          "transfer",
+		State:         paymentState(paySubtype, receiveStatus),
+		AmountMinor:   amountMinor,
+		Currency:      currency,
+		DisplayAmount: compactSpace(value.DisplayAmount),
+		TransactionID: compactSpace(value.TransactionID),
+		TransferID:    compactSpace(value.TransferID),
+		Memo:          compactSpace(value.Memo),
+		PayerWxID:     compactSpace(value.PayerWxID),
+		ReceiverWxID:  compactSpace(value.ReceiverWxID),
+		InvalidTime:   invalidTime,
+		EffectiveDate: effectiveDate,
+		ReceiveStatus: receiveStatus,
+		PaySubtype:    paySubtype,
+	}
+	if info.TransferID == "" && info.TransactionID == "" && info.AmountMinor == 0 && info.PaySubtype == 0 {
+		return nil
+	}
+	return info
+}
+
+func parseCNYDisplayAmountMinor(value string) int64 {
+	text := strings.TrimSpace(value)
+	upper := strings.ToUpper(text)
+	if !strings.Contains(text, "￥") && !strings.Contains(text, "¥") &&
+		!strings.Contains(text, "元") && !strings.Contains(upper, "CNY") {
+		return 0
+	}
+	var digits strings.Builder
+	started := false
+	decimalPlaces := -1
+	for _, current := range text {
+		switch {
+		case current >= '0' && current <= '9':
+			digits.WriteRune(current)
+			started = true
+			if decimalPlaces >= 0 {
+				decimalPlaces++
+			}
+		case current == '.' && started && decimalPlaces < 0:
+			decimalPlaces = 0
+		case current == ',' && started && decimalPlaces < 0:
+			continue
+		case started:
+			goto parsed
+		}
+	}
+parsed:
+	if digits.Len() == 0 || decimalPlaces > 2 {
+		return 0
+	}
+	if decimalPlaces < 0 {
+		decimalPlaces = 0
+	}
+	for decimalPlaces < 2 {
+		digits.WriteByte('0')
+		decimalPlaces++
+	}
+	amount, err := strconv.ParseInt(digits.String(), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return amount
+}
+
+func paymentState(paySubtype int, receiveStatus int) string {
+	switch receiveStatus {
+	case 3:
+		return "received"
+	case 4:
+		return "refused"
+	case 2:
+		return "expired"
+	case 5, 6:
+		return "closed"
+	}
+	if paySubtype == 1 {
+		return "pending"
+	}
+	return "unknown"
 }
 
 func paymentSubtypeForMessageType(messageType int32) string {
@@ -751,7 +885,10 @@ func isEmptyAppMsg(value appMsgXML) bool {
 		strings.TrimSpace(value.Description) == "" &&
 		strings.TrimSpace(value.URL) == "" &&
 		strings.TrimSpace(value.AppAttach.FileName) == "" &&
-		strings.TrimSpace(value.WeAppInfo.UserName) == ""
+		strings.TrimSpace(value.WeAppInfo.UserName) == "" &&
+		strings.TrimSpace(value.WCPayInfo.TransferID) == "" &&
+		strings.TrimSpace(value.WCPayInfo.TransactionID) == "" &&
+		strings.TrimSpace(value.WCPayInfo.AmountMinor) == ""
 }
 
 func isEmptyEmojiXML(value emojiXML) bool {

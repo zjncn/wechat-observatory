@@ -11,6 +11,7 @@ type Persistence interface {
 	UpdateDeviceIdentity(ctx context.Context, deviceName string, wxid string, nickname string) error
 	RecordInboundEvent(ctx context.Context, event MessageEvent) error
 	RecordOutboundEvent(ctx context.Context, event MessageEvent) error
+	MarkTransferReceived(ctx context.Context, device string, ownerWxID string, chatRecordID int64) error
 }
 
 type DeviceLocator interface {
@@ -70,53 +71,54 @@ type APIKeyView struct {
 }
 
 type StoredEventView struct {
-	ID                  int64    `json:"id"`
-	SourceID            string   `json:"source_id,omitempty"`
-	EventID             int64    `json:"event_id,omitempty"`
-	ChatRecordID        int64    `json:"chat_record_id,omitempty"`
-	Device              string   `json:"device"`
-	OwnerWxID           string   `json:"owner_wxid,omitempty"`
-	Direction           string   `json:"direction"`
-	FromWxID            string   `json:"from_wxid,omitempty"`
-	ToWxID              string   `json:"to_wxid,omitempty"`
-	RoomID              string   `json:"room_id,omitempty"`
-	SenderWxID          string   `json:"sender_wxid,omitempty"`
-	Text                string   `json:"text"`
-	MessageType         int32    `json:"message_type"`
-	MessageKind         string   `json:"kind,omitempty"`
-	AppMsgType          int32    `json:"appmsg_type,omitempty"`
-	AppMsgSubtype       string   `json:"appmsg_subtype,omitempty"`
-	AppMsgTitle         string   `json:"appmsg_title,omitempty"`
-	AppMsgDescription   string   `json:"appmsg_description,omitempty"`
-	AppMsgURL           string   `json:"appmsg_url,omitempty"`
-	AppMsgFileName      string   `json:"appmsg_file_name,omitempty"`
-	AppMsgAppName       string   `json:"appmsg_app_name,omitempty"`
-	Unsupported         []string `json:"unsupported,omitempty"`
-	Evidence            []string `json:"evidence,omitempty"`
-	LocationLatitude    *float64 `json:"location_latitude,omitempty"`
-	LocationLongitude   *float64 `json:"location_longitude,omitempty"`
-	LocationScale       int      `json:"location_scale,omitempty"`
-	LocationLabel       string   `json:"location_label,omitempty"`
-	LocationPoiName     string   `json:"location_poiname,omitempty"`
-	LocationInfoURL     string   `json:"location_info_url,omitempty"`
-	LocationPoiID       string   `json:"location_poi_id,omitempty"`
-	LocationFromPoiList bool     `json:"location_from_poi_list,omitempty"`
-	LocationPoiTips     string   `json:"location_poi_category_tips,omitempty"`
-	MediaKind           string   `json:"media_kind,omitempty"`
-	MediaMime           string   `json:"media_mime,omitempty"`
-	MediaName           string   `json:"media_name,omitempty"`
-	MediaURL            string   `json:"media_url,omitempty"`
-	MediaSize           int64    `json:"media_size,omitempty"`
-	RawProvider         string   `json:"raw_provider,omitempty"`
-	ChatID              string   `json:"chat_id,omitempty"`
-	ChatKind            string   `json:"chat_kind,omitempty"`
-	ChatName            string   `json:"chat_name,omitempty"`
-	ChatRemark          string   `json:"chat_remark,omitempty"`
-	ChatAlias           string   `json:"chat_alias,omitempty"`
-	ChatDisplayName     string   `json:"chat_display_name,omitempty"`
-	ChatDeleted         bool     `json:"chat_deleted,omitempty"`
-	CreateTime          int64    `json:"create_time"`
-	CreatedAt           string   `json:"created_at,omitempty"`
+	ID                  int64        `json:"id"`
+	SourceID            string       `json:"source_id,omitempty"`
+	EventID             int64        `json:"event_id,omitempty"`
+	ChatRecordID        int64        `json:"chat_record_id,omitempty"`
+	Device              string       `json:"device"`
+	OwnerWxID           string       `json:"owner_wxid,omitempty"`
+	Direction           string       `json:"direction"`
+	FromWxID            string       `json:"from_wxid,omitempty"`
+	ToWxID              string       `json:"to_wxid,omitempty"`
+	RoomID              string       `json:"room_id,omitempty"`
+	SenderWxID          string       `json:"sender_wxid,omitempty"`
+	Text                string       `json:"text"`
+	MessageType         int32        `json:"message_type"`
+	MessageKind         string       `json:"kind,omitempty"`
+	AppMsgType          int32        `json:"appmsg_type,omitempty"`
+	AppMsgSubtype       string       `json:"appmsg_subtype,omitempty"`
+	AppMsgTitle         string       `json:"appmsg_title,omitempty"`
+	AppMsgDescription   string       `json:"appmsg_description,omitempty"`
+	AppMsgURL           string       `json:"appmsg_url,omitempty"`
+	AppMsgFileName      string       `json:"appmsg_file_name,omitempty"`
+	AppMsgAppName       string       `json:"appmsg_app_name,omitempty"`
+	Unsupported         []string     `json:"unsupported,omitempty"`
+	Evidence            []string     `json:"evidence,omitempty"`
+	Payment             *PaymentInfo `json:"payment,omitempty"`
+	LocationLatitude    *float64     `json:"location_latitude,omitempty"`
+	LocationLongitude   *float64     `json:"location_longitude,omitempty"`
+	LocationScale       int          `json:"location_scale,omitempty"`
+	LocationLabel       string       `json:"location_label,omitempty"`
+	LocationPoiName     string       `json:"location_poiname,omitempty"`
+	LocationInfoURL     string       `json:"location_info_url,omitempty"`
+	LocationPoiID       string       `json:"location_poi_id,omitempty"`
+	LocationFromPoiList bool         `json:"location_from_poi_list,omitempty"`
+	LocationPoiTips     string       `json:"location_poi_category_tips,omitempty"`
+	MediaKind           string       `json:"media_kind,omitempty"`
+	MediaMime           string       `json:"media_mime,omitempty"`
+	MediaName           string       `json:"media_name,omitempty"`
+	MediaURL            string       `json:"media_url,omitempty"`
+	MediaSize           int64        `json:"media_size,omitempty"`
+	RawProvider         string       `json:"raw_provider,omitempty"`
+	ChatID              string       `json:"chat_id,omitempty"`
+	ChatKind            string       `json:"chat_kind,omitempty"`
+	ChatName            string       `json:"chat_name,omitempty"`
+	ChatRemark          string       `json:"chat_remark,omitempty"`
+	ChatAlias           string       `json:"chat_alias,omitempty"`
+	ChatDisplayName     string       `json:"chat_display_name,omitempty"`
+	ChatDeleted         bool         `json:"chat_deleted,omitempty"`
+	CreateTime          int64        `json:"create_time"`
+	CreatedAt           string       `json:"created_at,omitempty"`
 }
 
 type MessageFilter struct {

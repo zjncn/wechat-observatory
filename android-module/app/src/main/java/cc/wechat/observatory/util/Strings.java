@@ -68,4 +68,48 @@ public final class Strings {
         }
         return message.length() > 180 ? message.substring(0, 180) + "..." : message;
     }
+
+    /**
+     * Unlike {@link #shortError}, walks the full cause chain. ART wraps a class's
+     * original init/verify failure inside later NoClassDefFoundError/VerifyError
+     * throws for that same class; the JVM/ART spec requires the original
+     * exception to be attached as the cause, but {@link #shortError} only reads
+     * getMessage() on the outermost throwable and drops it.
+     */
+    public static String fullErrorChain(Throwable throwable) {
+        if (throwable == null) {
+            return "";
+        }
+        StringBuilder out = new StringBuilder();
+        Throwable current = throwable;
+        Throwable deepest = throwable;
+        int depth = 0;
+        while (current != null && depth < 8) {
+            if (depth > 0) {
+                out.append(" <- caused by ");
+            }
+            out.append(current.getClass().getName());
+            String message = current.getMessage();
+            if (!isBlank(message)) {
+                out.append(": ").append(message.length() > 300 ? message.substring(0, 300) + "..." : message);
+            }
+            deepest = current;
+            Throwable cause = current.getCause();
+            if (cause == current) {
+                break;
+            }
+            current = cause;
+            depth++;
+        }
+        out.append(" | ").append(deepest.getClass().getSimpleName()).append(" stack: ");
+        StackTraceElement[] frames = deepest.getStackTrace();
+        int frameCount = Math.min(frames == null ? 0 : frames.length, 6);
+        for (int i = 0; i < frameCount; i++) {
+            if (i > 0) {
+                out.append(" / ");
+            }
+            out.append(frames[i]);
+        }
+        return out.toString();
+    }
 }

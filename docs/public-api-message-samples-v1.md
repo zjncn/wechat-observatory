@@ -36,6 +36,7 @@
 | 媒体 | `media[]` | 每项包含 `kind`, `mime`, `name`, `url`, `size`, `opaque`。 |
 | 卡片 | `appmsg` | 链接、小程序、文件、引用、聊天记录、表情结构字段。 |
 | 位置 | `location` | 经纬度、缩放、POI、展示文本。 |
+| 转账 | `payment` | 状态、最小货币单位金额、币种和备注；操作性交易标识不公开。 |
 | 证据 | `evidence`, `unsupported` | 解析来源和明确降级项。适配器必须容忍未知项。 |
 
 ## 样例索引
@@ -53,7 +54,7 @@
 | `public-api-v1.link.json` | `appmsg.subtype=link`, `appmsg.title`, `appmsg.url` | `POST /api/v1/messages/link` | stable | 支持 source 转发或直接构造网页卡片。 |
 | `public-api-v1.mini-program.json` | `appmsg.subtype=mini_program`, `appmsg.type=33/36` | `POST /api/v1/messages/mini-program` | source-forward stable | 源消息转发更稳，直接构造仍需更多样本。 |
 | `public-api-v1.chat-history.json` | `kind=chat_history`, `appmsg.type=19` | `POST /api/v1/messages/chat-history` | forwarding-only | 不开放任意 raw XML 自动化。 |
-| `public-api-v1.payment.json` | `kind=payment`, `subtype=transfer/red_packet`, `unsupported[]` | no | parse-only | 红包/转账只做识别和脱敏，不做出站。 |
+| `public-api-v1.payment.json` | `kind=payment`, `subtype=transfer`, `payment.amount_minor/state` | `POST /api/v1/transfers/accept` | structured/experimental | 只按原消息 `chat_record_id` 收款；红包仍不支持领取自动化。 |
 | `public-api-v1.system.json` | `kind=system`, `message_type=10000` | no | parse-only | 默认不进入业务自动化。 |
 | `public-api-v1.unknown.json` | `kind=unknown`, `message_type`, `unsupported[]` | no | preserved | 只保留证据，不猜测业务含义。 |
 

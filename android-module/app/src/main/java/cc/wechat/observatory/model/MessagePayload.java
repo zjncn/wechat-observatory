@@ -16,6 +16,7 @@ public final class MessagePayload {
     public String roomId;
     public String sender;
     public String text;
+    public boolean atSelf;
     public int messageType;
     public String rawXml;
     public String mediaKind;
@@ -40,6 +41,7 @@ public final class MessagePayload {
                 + "\"room_id\":\"" + Strings.json(roomId) + "\","
                 + "\"sender\":\"" + Strings.json(sender) + "\","
                 + "\"text\":\"" + Strings.json(text) + "\","
+                + "\"at_self\":" + atSelf + ","
                 + "\"message_type\":" + messageType + ","
                 + "\"raw_xml\":\"" + Strings.json(rawXml) + "\","
                 + "\"media_kind\":\"" + Strings.json(mediaKind) + "\","

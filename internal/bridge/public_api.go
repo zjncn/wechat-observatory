@@ -210,6 +210,7 @@ func publicCapabilitiesResponse() PublicCapabilitiesResponse {
 				{Name: "room_id", Type: "string", Description: "群聊 room id。"},
 				{Name: "sender_wxid", Type: "string", Description: "群聊中的实际发送者 wxid；私聊可为空。"},
 				{Name: "text", Type: "string", Description: "展示文本、标题摘要或降级说明。"},
+				{Name: "at_self", Type: "boolean", Description: "群聊入站消息是否在手机本地 msgSource 中明确提及当前账号；原始 msgSource 不会上传。"},
 				{Name: "media[]", Type: "array<PublicMessageMedia>", Description: "媒体资源列表；不包含 media_base64。"},
 				{Name: "media[].kind", Type: "string", Description: "image、voice、video、file、emoji 等媒体类型。"},
 				{Name: "media[].mime", Type: "string", Description: "服务端识别或上报的媒体 MIME。"},
@@ -231,6 +232,9 @@ func publicCapabilitiesResponse() PublicCapabilitiesResponse {
 				{Name: "location.scale", Type: "integer", Description: "地图缩放。"},
 				{Name: "location.label", Type: "string", Description: "位置展示文本。"},
 				{Name: "location.poiname", Type: "string", Description: "POI 名称。"},
+				{Name: "payment", Type: "PaymentInfo", Description: "转账结构，包括状态、分币金额、币种和收款所需的稳定标识。"},
+				{Name: "payment.amount_minor", Type: "int64", Description: "最小货币单位金额；CNY 时单位为分。"},
+				{Name: "payment.state", Type: "string", Description: "pending、received、refused、expired、closed 或 unknown。"},
 				{Name: "unsupported", Type: "string[]", Description: "明确未支持或被降级的字段/行为。"},
 				{Name: "evidence", Type: "string[]", Description: "字段来源证据，例如 message.type、raw_xml 节点或本地 DB 记录。"},
 				{Name: "created_at", Type: "string", Description: "服务端记录时间。"},
@@ -250,7 +254,8 @@ func publicCapabilitiesResponse() PublicCapabilitiesResponse {
 			{Kind: MessageKindSystem, Subtype: "revoke", SendKind: OutboxKindRevoke, Title: "撤回", InboundStatus: "parse_only", OutboundStatus: "experimental", Verification: "sample_only", MessageTypes: []int32{10002}, SendEndpoint: "/api/v1/messages/revoke", RequiredFields: []string{"wx_ids", "chat_record_id"}, Notes: []string{"当前仅支持撤回本机已发送且本地 message 表仍可查询到的消息。"}},
 			{Kind: MessageKindAppMsg, Subtype: "mini_program", SendKind: OutboxKindMiniProgram, Title: "小程序", InboundStatus: "structured", OutboundStatus: "source_forward_stable", Verification: "db_verified", MessageTypes: []int32{MessageTypeAppMsg}, AppMsgTypes: []int32{33, 36}, SendEndpoint: "/api/v1/messages/mini-program", RequiredFields: []string{"wx_ids", "source_chat_record_id|appmsg_title+mini_program_username+mini_program_page_path"}, Notes: []string{"源消息转发已通过真实设备验证；直接构造仍需更多真实样本。"}},
 			{Kind: MessageKindChatHistory, SendKind: OutboxKindChatHistory, Title: "聊天记录", InboundStatus: "basic", OutboundStatus: "source_forward_only", Verification: "sample_only", MessageTypes: []int32{MessageTypeAppMsg}, AppMsgTypes: []int32{19}, SendEndpoint: "/api/v1/messages/chat-history", RequiredFields: []string{"wx_ids", "recorditem_xml|source_chat_record_ids|forward_original+source_chat_record_id"}, Unsupported: []string{"arbitrary_raw_xml_send"}, Notes: []string{"仅稳定支持已有来源消息转发；嵌套 recorditem 摘要仍在收口。"}},
-			{Kind: MessageKindPayment, Title: "支付", InboundStatus: "parse_only", OutboundStatus: "unsupported", Verification: "sample_only", MessageTypes: []int32{MessageTypeTransfer, MessageTypeRedPacket, MessageTypeAppMsg}, AppMsgTypes: []int32{AppMsgTypeTransfer, AppMsgTypeRedPacket}, Unsupported: []string{"payment_outbound_unsupported", "payment_sensitive_fields_redacted"}, Notes: []string{"红包、转账只做安全识别和脱敏，不提供发送自动化。"}},
+			{Kind: MessageKindPayment, Subtype: "transfer", SendKind: OutboxKindTransferAccept, Title: "转账", InboundStatus: "structured", OutboundStatus: "experimental", Verification: "static", MessageTypes: []int32{MessageTypeTransfer, MessageTypeAppMsg}, AppMsgTypes: []int32{AppMsgTypeTransfer}, SendEndpoint: "/api/v1/transfers/accept", RequiredFields: []string{"chat_record_id"}, Notes: []string{"只能收取本机入站且仍为待收状态的原始转账；模块会复核金额、收付款人并查询最终到账状态。"}},
+			{Kind: MessageKindPayment, Subtype: "red_packet", Title: "红包", InboundStatus: "parse_only", OutboundStatus: "unsupported", Verification: "sample_only", MessageTypes: []int32{MessageTypeRedPacket, MessageTypeAppMsg}, AppMsgTypes: []int32{AppMsgTypeRedPacket}, Unsupported: []string{"red_packet_outbound_unsupported", "red_packet_sensitive_fields_redacted"}, Notes: []string{"红包仍只做安全识别和脱敏。"}},
 			{Kind: MessageKindSystem, Title: "系统消息", InboundStatus: "parse_only", OutboundStatus: "non_goal", Verification: "parse_only", MessageTypes: []int32{10000}},
 			{Kind: MessageKindUnknown, Subtype: "unknown-business", Title: "未知高位业务类型", InboundStatus: "preserved", OutboundStatus: "unsupported", Verification: "sample_only", Unsupported: []string{"message_type:*"}, Notes: []string{"保留 message_type、unsupported 和 evidence，确认前不猜测业务含义。"}},
 		},
@@ -344,9 +349,11 @@ type PublicMessageEnvelope struct {
 	RoomID          string                  `json:"room_id,omitempty"`
 	SenderWxID      string                  `json:"sender_wxid,omitempty"`
 	Text            string                  `json:"text,omitempty"`
+	AtSelf          bool                    `json:"at_self,omitempty"`
 	Media           []PublicMessageMedia    `json:"media,omitempty"`
 	AppMsg          *PublicAppMsgEnvelope   `json:"appmsg,omitempty"`
 	Location        *PublicLocationEnvelope `json:"location,omitempty"`
+	Payment         *PublicPaymentEnvelope  `json:"payment,omitempty"`
 	Unsupported     []string                `json:"unsupported,omitempty"`
 	Evidence        []string                `json:"evidence,omitempty"`
 	CreateTime      int64                   `json:"create_time,omitempty"`
@@ -383,6 +390,21 @@ type PublicLocationEnvelope struct {
 	PoiID           string   `json:"poi_id,omitempty"`
 	FromPoiList     bool     `json:"from_poi_list,omitempty"`
 	PoiCategoryTips string   `json:"poi_category_tips,omitempty"`
+}
+
+// PublicPaymentEnvelope intentionally omits the operational transaction and
+// transfer identifiers. Accepting a transfer is bound to chat_record_id.
+type PublicPaymentEnvelope struct {
+	Type          string `json:"type,omitempty"`
+	State         string `json:"state,omitempty"`
+	AmountMinor   int64  `json:"amount_minor,omitempty"`
+	Currency      string `json:"currency,omitempty"`
+	DisplayAmount string `json:"display_amount,omitempty"`
+	Memo          string `json:"memo,omitempty"`
+	InvalidTime   int    `json:"invalid_time,omitempty"`
+	EffectiveDate int    `json:"effective_date,omitempty"`
+	ReceiveStatus int    `json:"receive_status,omitempty"`
+	PaySubtype    int    `json:"pay_subtype,omitempty"`
 }
 
 func (s *HTTPServer) getV1Messages(w http.ResponseWriter, r *http.Request) {
@@ -512,6 +534,7 @@ func publicStoredMessageEnvelope(item StoredEventView) PublicMessageEnvelope {
 		RoomID:          item.RoomID,
 		SenderWxID:      item.SenderWxID,
 		Text:            item.Text,
+		AtSelf:          publicEvidenceContains(item.Evidence, "msg_source.at_self"),
 		Unsupported:     item.Unsupported,
 		Evidence:        item.Evidence,
 		CreateTime:      item.CreateTime,
@@ -521,6 +544,7 @@ func publicStoredMessageEnvelope(item StoredEventView) PublicMessageEnvelope {
 	envelope.Media = publicMessageMedia(item.MediaKind, item.MediaMime, item.MediaName, item.MediaURL, item.MediaSize)
 	envelope.AppMsg = publicAppMsgEnvelope(item.AppMsgType, item.AppMsgSubtype, item.AppMsgTitle, item.AppMsgDescription, item.AppMsgURL, item.AppMsgFileName, item.AppMsgAppName)
 	envelope.Location = publicLocationEnvelope(item.LocationLatitude, item.LocationLongitude, item.LocationScale, item.LocationLabel, item.LocationPoiName, item.LocationInfoURL, item.LocationPoiID, item.LocationFromPoiList, item.LocationPoiTips)
+	envelope.Payment = publicPaymentEnvelope(item.Payment)
 	return envelope
 }
 
@@ -578,6 +602,7 @@ func publicEventMessageEnvelope(event MessageEvent) PublicMessageEnvelope {
 		RoomID:       event.RoomID,
 		SenderWxID:   event.Sender,
 		Text:         event.Text,
+		AtSelf:       event.AtSelf || publicEvidenceContains(event.Evidence, "msg_source.at_self"),
 		Unsupported:  event.Unsupported,
 		Evidence:     event.Evidence,
 		CreateTime:   event.Timestamp(),
@@ -585,7 +610,35 @@ func publicEventMessageEnvelope(event MessageEvent) PublicMessageEnvelope {
 	envelope.Media = publicMessageMedia(event.MediaKind, event.MediaMime, event.MediaName, event.MediaURL, event.MediaSize)
 	envelope.AppMsg = publicAppMsgEnvelope(event.AppMsgType, event.AppMsgSubtype, event.AppMsgTitle, event.AppMsgDescription, event.AppMsgURL, event.AppMsgFileName, event.AppMsgAppName)
 	envelope.Location = publicLocationEnvelope(event.LocationLatitude, event.LocationLongitude, event.LocationScale, event.LocationLabel, event.LocationPoiName, event.LocationInfoURL, event.LocationPoiID, event.LocationFromPoiList, event.LocationPoiTips)
+	envelope.Payment = publicPaymentEnvelope(event.Payment)
 	return envelope
+}
+
+func publicPaymentEnvelope(payment *PaymentInfo) *PublicPaymentEnvelope {
+	if payment == nil {
+		return nil
+	}
+	return &PublicPaymentEnvelope{
+		Type:          payment.Type,
+		State:         payment.State,
+		AmountMinor:   payment.AmountMinor,
+		Currency:      payment.Currency,
+		DisplayAmount: payment.DisplayAmount,
+		Memo:          payment.Memo,
+		InvalidTime:   payment.InvalidTime,
+		EffectiveDate: payment.EffectiveDate,
+		ReceiveStatus: payment.ReceiveStatus,
+		PaySubtype:    payment.PaySubtype,
+	}
+}
+
+func publicEvidenceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func publicStoredEnvelopeID(item StoredEventView) string {

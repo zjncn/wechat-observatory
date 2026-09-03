@@ -60,7 +60,8 @@ advance without weakening the safety contract.
 | `appmsg.mini_program` | `49` / appmsg `33/36` | Structured parser | Source forwarding works; direct builder sample-limited | `db-verified` for source forwarding and public API contract check. | Validate direct construction with known username/page path/icon samples. |
 | `chat_history` | `49` / appmsg `19` | Basic parser | Source/original forwarding only | `sample-only`; forwarded records ACK as `sent`, but nested item summary is not normalized. | Persist nested record summary; keep outbound limited to forwarding existing records. |
 | `system` | `10000` and variants | Filtered/limited | Non-goal | `parse-only`. | Keep excluded unless needed for state sync. |
-| `payment` | `419430449`, `436207665`; `49` / appmsg `2000/2001` | Parse-only classifier for transfer/red packet with sensitive fields redacted | Non-goal | `sample-only`; real inbound high-bit payment types observed and code covered by static fixtures. | Keep validating safe samples; keep outbound payment automation unsupported. |
+| `payment.transfer` | `419430449`; `49` / appmsg `2000` | Structured `wcpayinfo` parser with state, minor-unit amount, currency and memo; raw XML is removed | Source-bound receive action via `/api/v1/transfers/accept` | `static` from WeChat 8.0.77 reverse trace plus unit/API tests; device acceptance still requires a pending test transfer. | Keep real pending/already-received/expired samples in regression. |
+| `payment.red_packet` | `436207665`; `49` / appmsg `2001` | Parse-only classifier with sensitive fields redacted | Unsupported | `sample-only`; real inbound high-bit type observed. | Keep outbound red-packet automation unsupported. |
 | `unknown-business` | high-bit/custom types | Stored with raw evidence when available | Unsupported | `sample-only`; observed types include several unclassified numeric values. | Classify from real samples before adding protocol names. |
 
 ## Outbound Action Plan
@@ -76,6 +77,7 @@ advance without weakening the safety contract.
 | 7 | `chat_history` | Inbound parser and forwarding existing records only. |
 | 8 | `location` | Typed action uses WeChat LocationMsgSendTask and DB verification; real-device send verified. |
 | 9 | `emoji` | Structured inbound XML and typed outbound action are implemented; private/group source forwarding and group direct-md5 sending verified with outgoing `message.type=47`. |
+| 10 | `payment.transfer` | Source-bound acceptance validates the local inbound record and only ACKs after `transferquery` reports `trans_status=2001`; callers cannot provide amount, payer or transfer identifiers. |
 
 ## Current Evidence Snapshot
 

@@ -1879,6 +1879,7 @@ func TestModuleOutboxPollSkipsObservedOutgoingTextRetry(t *testing.T) {
 				OwnerWxID:   "wxid_self",
 				Direction:   string(DirectionSent),
 				ChatID:      "52806025813@chatroom",
+				ChatKind:    string(ChatKindRoom),
 				RoomID:      "52806025813@chatroom",
 				Text:        "重复文本",
 				MessageType: 1,
@@ -1932,6 +1933,7 @@ func TestAckOutboxConvertsObservedFailedTextToSent(t *testing.T) {
 				OwnerWxID:   "wxid_self",
 				Direction:   string(DirectionSent),
 				ChatID:      "52806025813@chatroom",
+				ChatKind:    string(ChatKindRoom),
 				RoomID:      "52806025813@chatroom",
 				Text:        "误判失败文本",
 				MessageType: 1,
@@ -2069,6 +2071,7 @@ func TestAckOutboxConvertsObservedFailedTextToSentWhenCreateTimeIsTimezoneShifte
 				OwnerWxID:   "wxid_self",
 				Direction:   string(DirectionSent),
 				ChatID:      "52806025813@chatroom",
+				ChatKind:    string(ChatKindRoom),
 				RoomID:      "52806025813@chatroom",
 				Text:        "时区偏移文本",
 				MessageType: 1,
@@ -2186,6 +2189,7 @@ type fakePersistence struct {
 	moduleActivities []ModuleActivity
 	contactSnapshots []ModuleContactSnapshotRequest
 	calls            []string
+	markedReceived   []int64
 }
 
 func (p *fakePersistence) UpdateDeviceIdentity(_ context.Context, deviceName string, wxid string, nickname string) error {
@@ -2227,6 +2231,12 @@ func (p *fakePersistence) RecordInboundEvent(_ context.Context, event MessageEve
 func (p *fakePersistence) RecordOutboundEvent(_ context.Context, event MessageEvent) error {
 	p.calls = append(p.calls, "outbound")
 	p.outboundEvents = append(p.outboundEvents, event)
+	return nil
+}
+
+func (p *fakePersistence) MarkTransferReceived(_ context.Context, _ string, _ string, chatRecordID int64) error {
+	p.calls = append(p.calls, "mark_transfer_received")
+	p.markedReceived = append(p.markedReceived, chatRecordID)
 	return nil
 }
 

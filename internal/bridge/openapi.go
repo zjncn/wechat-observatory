@@ -637,7 +637,7 @@ const openAPIDocsHTML = `<!doctype html>
         <div class="section-head">
           <div>
             <h2>能力矩阵</h2>
-            <p class="section-desc">状态分为稳定、样本可用、源转发、只读识别和不支持。支付类只识别不发送。</p>
+            <p class="section-desc">状态分为稳定、样本可用、源转发、只读识别和不支持。转账支持结构化识别与按原消息收款；红包仍只读识别。</p>
           </div>
         </div>
         <div class="section-body matrix-wrap">
@@ -662,9 +662,10 @@ const openAPIDocsHTML = `<!doctype html>
               <tr><td>引用</td><td><code>/api/v1/messages/quote</code></td><td><span class="status partial">样本可用</span></td><td><code>text</code>、<code>quote_msg_id</code></td><td>群聊引用仍需要更多样本。</td></tr>
               <tr><td>链接</td><td><code>/api/v1/messages/link</code></td><td><span class="status stable">稳定</span></td><td><code>source_chat_record_id</code> 或标题 + URL</td><td>可原样转发，也可直接构造。</td></tr>
               <tr><td>撤回</td><td><code>/api/v1/messages/revoke</code></td><td><span class="status partial">实验中</span></td><td><code>chat_record_id</code></td><td>仅支持撤回本机已发送且本地 message 表仍可查询的消息。</td></tr>
+              <tr><td>收取转账</td><td><code>/api/v1/transfers/accept</code></td><td><span class="status partial">实验中</span></td><td><code>chat_record_id</code></td><td>仅允许本机入站、待收且收款人为当前账号的原转账；以到账查询状态为准。</td></tr>
               <tr><td>小程序</td><td><code>/api/v1/messages/mini-program</code></td><td><span class="status partial">源转发稳定</span></td><td><code>source_chat_record_id</code> 或 username + page path</td><td>直接构造还需要真实样本。</td></tr>
               <tr><td>聊天记录</td><td><code>/api/v1/messages/chat-history</code></td><td><span class="status partial">转发限定</span></td><td><code>source_chat_record_ids</code>、<code>recorditem_xml</code></td><td>不开放任意 raw XML 自动化。</td></tr>
-              <tr><td>支付/红包/转账</td><td>无</td><td><span class="status readonly">只读识别</span></td><td><code>kind=payment</code>、<code>subtype</code></td><td>出站自动化明确不支持。</td></tr>
+              <tr><td>红包</td><td>无</td><td><span class="status readonly">只读识别</span></td><td><code>kind=payment</code>、<code>subtype=red_packet</code></td><td>红包领取自动化明确不支持。</td></tr>
               <tr><td>未知业务类型</td><td>无</td><td><span class="status stop">保留证据</span></td><td><code>message_type</code>、<code>unsupported</code></td><td>确认前不猜测业务含义。</td></tr>
             </tbody>
           </table>
@@ -768,7 +769,7 @@ const openAPIJSONDocument = `{
   "openapi": "3.0.3",
   "info": {
     "title": "微信观测站 API 协议",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "Go 网关和 Android 模块之间的公开协议面。外部接入优先使用 X-Bridge-API-Key；发送目标必须使用稳定 wxid 或群 room id；昵称、备注、群名只作为展示字段。"
   },
   "servers": [
@@ -940,6 +941,20 @@ const openAPIJSONDocument = `{
         "description": "最小撤回入口。当前只支持撤回本机已发送、且手机模块仍能在本地 message 表查到的消息。",
         "security": [{ "BridgeAPIKeyHeader": [] }, { "BridgeAPIKeyQuery": [] }, { "BridgePasswordHeader": [] }, { "BridgePasswordQuery": [] }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RevokeMessageRequest" } } } },
+        "responses": {
+          "200": { "$ref": "#/components/responses/SendQueuedResponse" },
+          "400": { "$ref": "#/components/responses/ErrorResponse" },
+          "401": { "$ref": "#/components/responses/ErrorResponse" }
+        }
+      }
+    },
+    "/api/v1/transfers/accept": {
+      "post": {
+        "tags": ["外部发送"],
+        "summary": "收取待收转账",
+        "description": "按本机原始入站消息 chat_record_id 收款。模块会再次核对消息类型、待收状态、金额、付款人和当前收款账号，并在 transferquery 返回 2001 后才 ACK sent。不要传 wx_ids。",
+        "security": [{ "BridgeAPIKeyHeader": [] }, { "BridgeAPIKeyQuery": [] }, { "BridgePasswordHeader": [] }, { "BridgePasswordQuery": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransferAcceptRequest" }, "example": { "chat_record_id": 123456 } } } },
         "responses": {
           "200": { "$ref": "#/components/responses/SendQueuedResponse" },
           "400": { "$ref": "#/components/responses/ErrorResponse" },
@@ -1876,6 +1891,15 @@ const openAPIJSONDocument = `{
           }
         ]
       },
+      "TransferAcceptRequest": {
+        "type": "object",
+        "required": ["chat_record_id"],
+        "properties": {
+          "device": { "type": "string", "description": "API Key 绑定设备时可省略。" },
+          "owner_wxid": { "type": "string", "description": "API Key 绑定设备时可省略；若提供必须是当前登录账号。" },
+          "chat_record_id": { "type": "integer", "format": "int64", "minimum": 1, "description": "本机 message 表中待收转账的原始入站消息 ID。" }
+        }
+      },
       "MiniProgramMessageRequest": {
         "allOf": [
           { "$ref": "#/components/schemas/SendTarget" },
@@ -1941,18 +1965,18 @@ const openAPIJSONDocument = `{
       },
       "SendActionRequest": {
         "type": "object",
-        "required": ["device", "owner_wxid", "wx_ids", "kind"],
+        "required": ["device", "owner_wxid", "kind"],
         "properties": {
           "device": { "type": "string", "example": "phone-a" },
           "owner_wxid": { "type": "string", "description": "该设备当前登录的微信 wxid，用来防止切号后误发。" },
           "wx_ids": {
             "type": "array",
             "items": { "type": "string" },
-            "description": "目标好友 wxid 或群 room id。不要传显示名。"
+            "description": "目标好友 wxid 或群 room id。除 transfer_accept 外必填；不要传显示名。"
           },
           "kind": {
             "type": "string",
-            "enum": ["text", "image", "video", "voice", "file", "emoji", "location", "quote", "link", "revoke", "mini_program", "chat_history"]
+            "enum": ["text", "image", "video", "voice", "file", "emoji", "location", "quote", "link", "revoke", "mini_program", "chat_history", "transfer_accept"]
           },
           "text": { "type": "string" },
           "media_kind": { "type": "string" },
@@ -2071,9 +2095,11 @@ const openAPIJSONDocument = `{
           "room_id": { "type": "string" },
           "sender_wxid": { "type": "string" },
           "text": { "type": "string" },
+          "at_self": { "type": "boolean", "description": "群聊入站消息是否在微信本地 msgSource 中明确提及当前账号；原始 msgSource 不会上传。" },
           "media": { "type": "array", "items": { "$ref": "#/components/schemas/PublicMessageMedia" } },
           "appmsg": { "$ref": "#/components/schemas/PublicAppMsgEnvelope" },
           "location": { "$ref": "#/components/schemas/PublicLocationEnvelope" },
+          "payment": { "$ref": "#/components/schemas/PublicPaymentEnvelope" },
           "unsupported": { "type": "array", "items": { "type": "string" } },
           "evidence": { "type": "array", "items": { "type": "string" } },
           "create_time": { "type": "integer", "format": "int64" },
@@ -2118,6 +2144,42 @@ const openAPIJSONDocument = `{
           "poi_category_tips": { "type": "string" }
         }
       },
+      "PaymentInfo": {
+        "type": "object",
+        "description": "从微信 wcpayinfo 提取的稳定转账字段；不包含原始 XML。",
+        "properties": {
+          "type": { "type": "string", "example": "transfer" },
+          "state": { "type": "string", "enum": ["pending", "received", "refused", "expired", "closed", "unknown"] },
+          "amount_minor": { "type": "integer", "format": "int64", "description": "最小货币单位；CNY 时为分。" },
+          "currency": { "type": "string", "example": "CNY" },
+          "display_amount": { "type": "string", "example": "￥12.34" },
+          "transaction_id": { "type": "string" },
+          "transfer_id": { "type": "string" },
+          "memo": { "type": "string" },
+          "payer_wxid": { "type": "string" },
+          "receiver_wxid": { "type": "string" },
+          "invalid_time": { "type": "integer" },
+          "effective_date": { "type": "integer" },
+          "receive_status": { "type": "integer" },
+          "pay_subtype": { "type": "integer" }
+        }
+      },
+      "PublicPaymentEnvelope": {
+        "type": "object",
+        "description": "公开转账结构。操作性 transaction_id/transfer_id 不对外返回；收款只能使用 chat_record_id。",
+        "properties": {
+          "type": { "type": "string", "example": "transfer" },
+          "state": { "type": "string", "enum": ["pending", "received", "refused", "expired", "closed", "unknown"] },
+          "amount_minor": { "type": "integer", "format": "int64", "description": "最小货币单位；CNY 时为分。" },
+          "currency": { "type": "string", "example": "CNY" },
+          "display_amount": { "type": "string", "example": "￥12.34" },
+          "memo": { "type": "string" },
+          "invalid_time": { "type": "integer" },
+          "effective_date": { "type": "integer" },
+          "receive_status": { "type": "integer" },
+          "pay_subtype": { "type": "integer" }
+        }
+      },
       "MessageEvent": {
         "type": "object",
         "properties": {
@@ -2133,6 +2195,7 @@ const openAPIJSONDocument = `{
           "room_id": { "type": "string" },
           "sender": { "type": "string" },
           "text": { "type": "string" },
+          "at_self": { "type": "boolean", "description": "由手机端本地解析 msgSource 后产生的安全布尔标记。" },
           "message_type": { "type": "integer", "format": "int32" },
           "raw_xml": { "type": "string" },
           "appmsg_type": { "type": "integer", "format": "int32" },
@@ -2144,6 +2207,7 @@ const openAPIJSONDocument = `{
           "appmsg_app_name": { "type": "string" },
           "unsupported": { "type": "array", "items": { "type": "string" } },
           "evidence": { "type": "array", "items": { "type": "string" } },
+          "payment": { "$ref": "#/components/schemas/PaymentInfo" },
           "location_latitude": { "type": "number", "format": "double" },
           "location_longitude": { "type": "number", "format": "double" },
           "location_scale": { "type": "integer" },
