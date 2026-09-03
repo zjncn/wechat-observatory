@@ -94,6 +94,7 @@ func TestPublicV1CapabilitiesDescribeProtocolWithoutSecrets(t *testing.T) {
 	}
 
 	var transfer *PublicMessageCapability
+	var transferDecline *PublicMessageCapability
 	var redPacket *PublicMessageCapability
 	var text *PublicMessageCapability
 	var voice *PublicMessageCapability
@@ -102,8 +103,11 @@ func TestPublicV1CapabilitiesDescribeProtocolWithoutSecrets(t *testing.T) {
 	var revoke *PublicMessageCapability
 	for i := range got.Capabilities {
 		capability := &got.Capabilities[i]
-		if capability.Kind == MessageKindPayment && capability.Subtype == "transfer" {
+		if capability.Kind == MessageKindPayment && capability.Subtype == "transfer" && capability.SendKind == OutboxKindTransferAccept {
 			transfer = capability
+		}
+		if capability.Kind == MessageKindPayment && capability.Subtype == "transfer" && capability.SendKind == OutboxKindTransferDecline {
+			transferDecline = capability
 		}
 		if capability.Kind == MessageKindPayment && capability.Subtype == "red_packet" {
 			redPacket = capability
@@ -141,6 +145,9 @@ func TestPublicV1CapabilitiesDescribeProtocolWithoutSecrets(t *testing.T) {
 	}
 	if transfer == nil || transfer.InboundStatus != "structured" || transfer.OutboundStatus != "experimental" || transfer.SendEndpoint != "/api/v1/transfers/accept" {
 		t.Fatalf("transfer capability should expose structured accept support: %+v", transfer)
+	}
+	if transferDecline == nil || transferDecline.InboundStatus != "structured" || transferDecline.OutboundStatus != "experimental" || transferDecline.SendEndpoint != "/api/v1/transfers/decline" {
+		t.Fatalf("transfer capability should expose structured decline support: %+v", transferDecline)
 	}
 	if redPacket == nil || !containsString(redPacket.Unsupported, "red_packet_sensitive_fields_redacted") {
 		t.Fatalf("red packet redaction marker missing: %+v", redPacket)
@@ -222,6 +229,28 @@ func TestPublicV1TransferAcceptQueuesSourceBoundAction(t *testing.T) {
 	items := pollOutbox(t, service, "phone-a", 10)
 	if len(items) != 1 || items[0].Kind != OutboxKindTransferAccept || items[0].WxID != "" {
 		t.Fatalf("unexpected transfer accept outbox item: %+v", items)
+	}
+	if !bytes.Contains(items[0].PayloadJSON, []byte(`"chat_record_id":12345`)) {
+		t.Fatalf("transfer source id missing from payload: %s", items[0].PayloadJSON)
+	}
+}
+
+func TestPublicV1TransferDeclineQueuesSourceBoundAction(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+	body := []byte(`{"device":"phone-a","owner_wxid":"wxid_self","chat_record_id":12345}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/transfers/decline", bytes.NewReader(body))
+	req.Header.Set("X-Bridge-Password", "admin")
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected transfer decline status %d body=%s", rec.Code, rec.Body.String())
+	}
+	items := pollOutbox(t, service, "phone-a", 10)
+	if len(items) != 1 || items[0].Kind != OutboxKindTransferDecline || items[0].WxID != "" {
+		t.Fatalf("unexpected transfer decline outbox item: %+v", items)
 	}
 	if !bytes.Contains(items[0].PayloadJSON, []byte(`"chat_record_id":12345`)) {
 		t.Fatalf("transfer source id missing from payload: %s", items[0].PayloadJSON)

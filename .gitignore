@@ -18,6 +18,7 @@ web/admin/*.tsbuildinfo
 android-module/.gradle/
 android-module/build/
 android-module/app/build/
+/build/
 
 # Local-only and generated artifacts
 .env.*

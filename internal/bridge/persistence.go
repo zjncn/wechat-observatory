@@ -12,6 +12,7 @@ type Persistence interface {
 	RecordInboundEvent(ctx context.Context, event MessageEvent) error
 	RecordOutboundEvent(ctx context.Context, event MessageEvent) error
 	MarkTransferReceived(ctx context.Context, device string, ownerWxID string, chatRecordID int64) error
+	MarkTransferDeclined(ctx context.Context, device string, ownerWxID string, chatRecordID int64) error
 }
 
 type DeviceLocator interface {

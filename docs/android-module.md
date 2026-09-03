@@ -76,7 +76,7 @@ POST /module/register
 3. 服务端优先把同批次 outbox 分散到不同 `wxid + kind` lane，模块再按 lane 调度；同 lane 顺序发送，不同 lane 可并发执行。
 4. 模块通过 WebSocket 或 HTTP ACK 回报结果。
 
-当前 Action Outbox v1 已覆盖 `text`、`image`、`video`、`voice`、`file`、`emoji`、`location`、`quote`、`link`、`mini_program`、`chat_history`，并提供源消息绑定的 `transfer_accept`。`transfer_accept` 不接受调用方提供的目标或金额，而是从本机 `chat_record_id` 重新解析转账并查询最终到账状态。红包和系统消息仍只做观测或标记为不支持，实际可用状态以 `GET /api/v1/capabilities` 为准。
+当前 Action Outbox v1 已覆盖 `text`、`image`、`video`、`voice`、`file`、`emoji`、`location`、`quote`、`link`、`mini_program`、`chat_history`，并提供源消息绑定的 `transfer_accept`/`transfer_decline`。这两者都不接受调用方提供的目标或金额，而是从本机 `chat_record_id` 重新解析转账并查询最终到账状态——`transfer_accept` 确认收款，`transfer_decline` 拒收并把钱原路退回付款人，二者共用同一个微信转账操作类，仅操作参数不同。红包和系统消息仍只做观测或标记为不支持，实际可用状态以 `GET /api/v1/capabilities` 为准。
 
 WebSocket 不可用时，模块会退回 HTTP 轮询。
 

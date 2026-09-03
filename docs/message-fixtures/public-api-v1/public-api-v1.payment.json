@@ -1,6 +1,7 @@
 {
   "adapter_notes": [
-    "转账金额使用最小货币单位；收款只能提交原消息 chat_record_id。",
+    "转账金额使用最小货币单位；收款/拒收只能提交原消息 chat_record_id。",
+    "拒收待收转账走独立接口 POST /api/v1/transfers/decline（同样只需要 chat_record_id），成功后 payment.state 变为 refused；已收下的转账无法通过该接口撤回或退还。",
     "公开信封不返回 transaction_id、transfer_id 或 raw XML；红包仍不提供领取自动化。"
   ],
   "capability_status": "structured_experimental",

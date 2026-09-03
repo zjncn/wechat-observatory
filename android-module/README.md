@@ -149,11 +149,15 @@ checks through Action Outbox dispatch.
 
 Action Outbox v1 dispatches `text`, `image`, `video`, `voice`, `file`, `emoji`,
 `location`, `quote`, `link`, `mini_program`, `chat_history`, and source-bound
-`transfer_accept` actions from the gateway
+`transfer_accept`/`transfer_decline` actions from the gateway
 queue. Unsupported or malformed kinds must ACK `failed` instead of being
-silently skipped. Transfer acceptance re-reads the local source message and
-ACKs success only after WeChat's transfer query reports received; red packets
-and system-only message types remain observation boundaries.
+silently skipped. Both transfer actions re-read the local source message and
+share the same WeChat NetScene construction; they only differ in the operation
+passed to it (`confirm` vs `refuse`). Transfer acceptance ACKs success only
+after WeChat's transfer query reports received (`2001`); decline ACKs success
+only after the query reports a non-`2001` terminal status, returning the
+pending transfer to the sender. Red packets and system-only message types
+remain observation boundaries.
 
 On supported WeChat Android builds, the installed app can run through Tinker. The send
 adapter must resolve WeChat classes with the patched runtime loader returned by

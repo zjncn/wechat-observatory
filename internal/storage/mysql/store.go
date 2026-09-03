@@ -561,6 +561,24 @@ func (s *Store) MarkTransferReceived(ctx context.Context, device string, ownerWx
 	return err
 }
 
+// markTransferDeclinedStatement mirrors markTransferReceivedStatement for the
+// transfer_decline outbox action: receive_status 4 maps to paymentState's
+// "refused" case (see internal/bridge/appmsg.go).
+const markTransferDeclinedStatement = `
+	UPDATE bridge_message_events
+	SET payment = JSON_SET(payment, '$.state', 'refused', '$.receive_status', 4)
+	WHERE device = ?
+		AND owner_wxid <=> ?
+		AND direction = 'recv'
+		AND chat_record_id = ?
+		AND payment IS NOT NULL
+	LIMIT 1`
+
+func (s *Store) MarkTransferDeclined(ctx context.Context, device string, ownerWxID string, chatRecordID int64) error {
+	_, err := s.db.ExecContext(ctx, markTransferDeclinedStatement, device, nullString(ownerWxID), chatRecordID)
+	return err
+}
+
 const messageEventDedupUpdateStatement = `
 	UPDATE bridge_message_events
 	SET

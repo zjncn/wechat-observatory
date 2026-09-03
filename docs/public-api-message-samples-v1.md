@@ -54,7 +54,7 @@
 | `public-api-v1.link.json` | `appmsg.subtype=link`, `appmsg.title`, `appmsg.url` | `POST /api/v1/messages/link` | stable | 支持 source 转发或直接构造网页卡片。 |
 | `public-api-v1.mini-program.json` | `appmsg.subtype=mini_program`, `appmsg.type=33/36` | `POST /api/v1/messages/mini-program` | source-forward stable | 源消息转发更稳，直接构造仍需更多样本。 |
 | `public-api-v1.chat-history.json` | `kind=chat_history`, `appmsg.type=19` | `POST /api/v1/messages/chat-history` | forwarding-only | 不开放任意 raw XML 自动化。 |
-| `public-api-v1.payment.json` | `kind=payment`, `subtype=transfer`, `payment.amount_minor/state` | `POST /api/v1/transfers/accept` | structured/experimental | 只按原消息 `chat_record_id` 收款；红包仍不支持领取自动化。 |
+| `public-api-v1.payment.json` | `kind=payment`, `subtype=transfer`, `payment.amount_minor/state` | `POST /api/v1/transfers/accept`、`POST /api/v1/transfers/decline` | structured/experimental | 只按原消息 `chat_record_id` 收款或拒收（拒收把钱原路退回付款人，`payment.state` 变为 `refused`）；红包仍不支持领取自动化。 |
 | `public-api-v1.system.json` | `kind=system`, `message_type=10000` | no | parse-only | 默认不进入业务自动化。 |
 | `public-api-v1.unknown.json` | `kind=unknown`, `message_type`, `unsupported[]` | no | preserved | 只保留证据，不猜测业务含义。 |
 

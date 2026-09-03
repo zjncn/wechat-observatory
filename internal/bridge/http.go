@@ -66,6 +66,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/messages/link", s.requirePublicAPI(s.sendV1Message(OutboxKindLink)))
 	mux.HandleFunc("POST /api/v1/messages/revoke", s.requirePublicAPI(s.sendV1Message(OutboxKindRevoke)))
 	mux.HandleFunc("POST /api/v1/transfers/accept", s.requirePublicAPI(s.sendV1Message(OutboxKindTransferAccept)))
+	mux.HandleFunc("POST /api/v1/transfers/decline", s.requirePublicAPI(s.sendV1Message(OutboxKindTransferDecline)))
 	mux.HandleFunc("POST /api/v1/messages/mini-program", s.requirePublicAPI(s.sendV1Message(OutboxKindMiniProgram)))
 	mux.HandleFunc("POST /api/v1/messages/chat-history", s.requirePublicAPI(s.sendV1Message(OutboxKindChatHistory)))
 	mux.HandleFunc("GET /api/v1/capabilities", s.requirePublicAPI(s.publicCapabilities))

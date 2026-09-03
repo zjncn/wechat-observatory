@@ -35,7 +35,8 @@ const (
 	OutboxKindQuote          = "quote"
 	OutboxKindLink           = "link"
 	OutboxKindRevoke         = "revoke"
-	OutboxKindTransferAccept = "transfer_accept"
+	OutboxKindTransferAccept  = "transfer_accept"
+	OutboxKindTransferDecline = "transfer_decline"
 
 	OutboxKindChatHistory = "chat_history"
 	OutboxKindMiniProgram = "mini_program"
@@ -266,7 +267,7 @@ func (req SendActionRequest) Validate(defaultDevice string) (SendActionRequest, 
 	if req.Device == "" {
 		return req, errors.New("device is required")
 	}
-	if req.Kind == OutboxKindTransferAccept && len(req.WxIDs) == 0 {
+	if (req.Kind == OutboxKindTransferAccept || req.Kind == OutboxKindTransferDecline) && len(req.WxIDs) == 0 {
 		// The Android module resolves the conversation and sender from the exact
 		// local source message, so callers cannot substitute a mismatched wxid.
 		req.WxIDs = []string{""}
@@ -275,7 +276,7 @@ func (req SendActionRequest) Validate(defaultDevice string) (SendActionRequest, 
 	}
 	for i := range req.WxIDs {
 		req.WxIDs[i] = strings.TrimSpace(req.WxIDs[i])
-		if req.WxIDs[i] == "" && req.Kind != OutboxKindTransferAccept {
+		if req.WxIDs[i] == "" && req.Kind != OutboxKindTransferAccept && req.Kind != OutboxKindTransferDecline {
 			return req, errors.New("wx_ids cannot contain empty values")
 		}
 	}
@@ -398,6 +399,14 @@ func (req SendActionRequest) Validate(defaultDevice string) (SendActionRequest, 
 		req.SourceChatRecordID = req.ChatRecordID
 		if req.Text == "" {
 			req.Text = "[收款]"
+		}
+	case OutboxKindTransferDecline:
+		if req.ChatRecordID <= 0 {
+			return req, errors.New("chat_record_id is required")
+		}
+		req.SourceChatRecordID = req.ChatRecordID
+		if req.Text == "" {
+			req.Text = "[拒收转账]"
 		}
 	case OutboxKindLink:
 		if req.SourceChatRecordID <= 0 {

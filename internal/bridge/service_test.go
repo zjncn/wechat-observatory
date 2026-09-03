@@ -2190,6 +2190,7 @@ type fakePersistence struct {
 	contactSnapshots []ModuleContactSnapshotRequest
 	calls            []string
 	markedReceived   []int64
+	markedDeclined   []int64
 }
 
 func (p *fakePersistence) UpdateDeviceIdentity(_ context.Context, deviceName string, wxid string, nickname string) error {
@@ -2237,6 +2238,12 @@ func (p *fakePersistence) RecordOutboundEvent(_ context.Context, event MessageEv
 func (p *fakePersistence) MarkTransferReceived(_ context.Context, _ string, _ string, chatRecordID int64) error {
 	p.calls = append(p.calls, "mark_transfer_received")
 	p.markedReceived = append(p.markedReceived, chatRecordID)
+	return nil
+}
+
+func (p *fakePersistence) MarkTransferDeclined(_ context.Context, _ string, _ string, chatRecordID int64) error {
+	p.calls = append(p.calls, "mark_transfer_declined")
+	p.markedDeclined = append(p.markedDeclined, chatRecordID)
 	return nil
 }
 

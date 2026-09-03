@@ -663,6 +663,7 @@ const openAPIDocsHTML = `<!doctype html>
               <tr><td>链接</td><td><code>/api/v1/messages/link</code></td><td><span class="status stable">稳定</span></td><td><code>source_chat_record_id</code> 或标题 + URL</td><td>可原样转发，也可直接构造。</td></tr>
               <tr><td>撤回</td><td><code>/api/v1/messages/revoke</code></td><td><span class="status partial">实验中</span></td><td><code>chat_record_id</code></td><td>仅支持撤回本机已发送且本地 message 表仍可查询的消息。</td></tr>
               <tr><td>收取转账</td><td><code>/api/v1/transfers/accept</code></td><td><span class="status partial">实验中</span></td><td><code>chat_record_id</code></td><td>仅允许本机入站、待收且收款人为当前账号的原转账；以到账查询状态为准。</td></tr>
+              <tr><td>拒收转账</td><td><code>/api/v1/transfers/decline</code></td><td><span class="status partial">实验中</span></td><td><code>chat_record_id</code></td><td>仅允许拒收本机入站、待收状态的原转账，钱款原路退回付款人；已收下的转账无法通过此接口退还。</td></tr>
               <tr><td>小程序</td><td><code>/api/v1/messages/mini-program</code></td><td><span class="status partial">源转发稳定</span></td><td><code>source_chat_record_id</code> 或 username + page path</td><td>直接构造还需要真实样本。</td></tr>
               <tr><td>聊天记录</td><td><code>/api/v1/messages/chat-history</code></td><td><span class="status partial">转发限定</span></td><td><code>source_chat_record_ids</code>、<code>recorditem_xml</code></td><td>不开放任意 raw XML 自动化。</td></tr>
               <tr><td>红包</td><td>无</td><td><span class="status readonly">只读识别</span></td><td><code>kind=payment</code>、<code>subtype=red_packet</code></td><td>红包领取自动化明确不支持。</td></tr>
@@ -955,6 +956,20 @@ const openAPIJSONDocument = `{
         "description": "按本机原始入站消息 chat_record_id 收款。模块会再次核对消息类型、待收状态、金额、付款人和当前收款账号，并在 transferquery 返回 2001 后才 ACK sent。不要传 wx_ids。",
         "security": [{ "BridgeAPIKeyHeader": [] }, { "BridgeAPIKeyQuery": [] }, { "BridgePasswordHeader": [] }, { "BridgePasswordQuery": [] }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransferAcceptRequest" }, "example": { "chat_record_id": 123456 } } } },
+        "responses": {
+          "200": { "$ref": "#/components/responses/SendQueuedResponse" },
+          "400": { "$ref": "#/components/responses/ErrorResponse" },
+          "401": { "$ref": "#/components/responses/ErrorResponse" }
+        }
+      }
+    },
+    "/api/v1/transfers/decline": {
+      "post": {
+        "tags": ["外部发送"],
+        "summary": "拒收待收转账",
+        "description": "按本机原始入站消息 chat_record_id 拒收，钱款原路退回付款人。模块会再次核对消息类型、待收状态、金额、付款人和当前收款账号，并在 transferquery 返回非 2001 的终态后才 ACK sent。已经收下（到账状态 2001）的转账无法通过此接口撤回或退还。不要传 wx_ids。",
+        "security": [{ "BridgeAPIKeyHeader": [] }, { "BridgeAPIKeyQuery": [] }, { "BridgePasswordHeader": [] }, { "BridgePasswordQuery": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransferDeclineRequest" }, "example": { "chat_record_id": 123456 } } } },
         "responses": {
           "200": { "$ref": "#/components/responses/SendQueuedResponse" },
           "400": { "$ref": "#/components/responses/ErrorResponse" },
@@ -1898,6 +1913,15 @@ const openAPIJSONDocument = `{
           "device": { "type": "string", "description": "API Key 绑定设备时可省略。" },
           "owner_wxid": { "type": "string", "description": "API Key 绑定设备时可省略；若提供必须是当前登录账号。" },
           "chat_record_id": { "type": "integer", "format": "int64", "minimum": 1, "description": "本机 message 表中待收转账的原始入站消息 ID。" }
+        }
+      },
+      "TransferDeclineRequest": {
+        "type": "object",
+        "required": ["chat_record_id"],
+        "properties": {
+          "device": { "type": "string", "description": "API Key 绑定设备时可省略。" },
+          "owner_wxid": { "type": "string", "description": "API Key 绑定设备时可省略；若提供必须是当前登录账号。" },
+          "chat_record_id": { "type": "integer", "format": "int64", "minimum": 1, "description": "本机 message 表中待收转账的原始入站消息 ID；转账必须仍处于待收状态。" }
         }
       },
       "MiniProgramMessageRequest": {

@@ -152,6 +152,26 @@ curl -X POST \
 `sent`；其他状态和超时都返回 `failed`。首次 HTTP 200 只表示任务已入队，
 请继续查询响应里的 `status_url`。
 
+## 拒收待收转账
+
+```bash
+curl -X POST \
+  -H "X-Bridge-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"chat_record_id":123456}' \
+  http://127.0.0.1:8088/api/v1/transfers/decline
+```
+
+和收取转账一样只接受本机原始入站消息的 `chat_record_id`，不接收 `wx_ids`。
+手机模块做的前置校验也完全一样（消息确为转账、当前仍为待收状态、金额有效、
+付款人与原消息一致、收款人为当前登录账号），唯一区别是最后调用微信转账操
+作接口时传的操作是"拒收"而不是"确认"，钱款会原路退回给付款人。确认请求
+后同样会调用转账查询接口，只有返回终态（非 `2001`，即钱没有被收走）才把
+outbox ACK 为 `sent`；如果查询发现状态已经是 `2001`（说明已经被收下，可能
+是这期间被其他途径收款了），拒收会失败，因为已收下的转账无法通过这个接口
+撤回或退还。首次 HTTP 200 同样只表示任务已入队，请继续查询响应里的
+`status_url`。成功后消息记录里的 `payment.state` 会更新为 `refused`。
+
 ## 管理端发送接口
 
 ```bash
@@ -175,7 +195,7 @@ curl -X POST \
 ```
 
 外部系统不要依赖管理密码接口，推荐使用 `/api/v1/messages/{kind}`、
-`/api/v1/transfers/accept` 和 `/api/v1/outbox/{id}`。
+`/api/v1/transfers/accept`、`/api/v1/transfers/decline` 和 `/api/v1/outbox/{id}`。
 
 ## 实时事件
 

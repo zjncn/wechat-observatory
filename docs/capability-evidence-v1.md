@@ -33,7 +33,8 @@ payment details.
 | `link` | `/api/v1/messages/link` | `structured` | `stable` | `db_verified` |
 | `mini_program` | `/api/v1/messages/mini-program` | `structured` | `source_forward_stable` | `db_verified` |
 | `chat_history` | `/api/v1/messages/chat-history` | `basic` | `source_forward_only` | `sample_only` |
-| `payment.transfer` | `/api/v1/transfers/accept` | `structured` | `experimental` | `static` |
+| `payment.transfer` | `/api/v1/transfers/accept` | `structured` | `experimental` | `user_confirmed` |
+| `payment.transfer` | `/api/v1/transfers/decline` | `structured` | `experimental` | `user_confirmed` |
 | `payment.red_packet` | none | `parse_only` | `unsupported` | `sample_only` |
 | `system` | none | `parse_only` | `non_goal` | `parse_only` |
 | `unknown-business` | none | `preserved` | `unsupported` | `sample_only` |
@@ -53,7 +54,8 @@ payment details.
 | `link` | `3 / 0` | `62` | `chat_record_id=9577`, `message.type=49`, appmsg `5` | DB-verified typed builder and source-compatible schema. |
 | `mini_program` | `4 / 0` | `72` | `chat_record_id=9628`, `message.type=49`, appmsg `33` | Source forwarding is stable; direct construction still needs real username/page/icon samples. |
 | `chat_history` | `6 / 0` | `44` | `chat_record_id=8269`, `message.type=49`, appmsg `19` | Source/original forwarding works; nested record summary is not normalized enough for stable. |
-| `transfer_accept` | `0 / 0` | none | WeChat 8.0.77 static chain: `transferoperation` func 1691 followed by `transferquery` func 1628; success requires status `2001` | Implementation and safe-failure tests are required before a live pending transfer is used. |
+| `transfer_accept` | `6 / 361` | `1504` | `chat_record_id=67168`, `trans_status=2001` (accepted) | Device-verified end-to-end on WeChat 8.0.77 / Android 16 dual-instance; the large historical failed count is dominated by the multi-day root-cause investigation (ClassLoader/Tinker mismatch, wrong NetScene enqueue path, `netId`/`limit` sentinel bug) that blocked this specific device before the fix landed. |
+| `transfer_decline` | `1 / 0` | `1505` | `chat_record_id=67488`, `trans_status=2002` (declined) | Device-verified on first live attempt; reuses the same `n0` NetScene class as `transfer_accept` with `operation=refuse` instead of `confirm`. `2002` is now confirmed to mean "declined"; other non-`2001` terminal codes (`2003`/`2004`/`2005`) are still uncalibrated. |
 
 ## Inbound Evidence Snapshot
 

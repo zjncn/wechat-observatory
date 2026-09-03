@@ -1,6 +1,6 @@
 /*
  * @input LSPosed/Xposed hook callbacks, BridgeConfig, WeChat runtime classes, HTTP/WebSocket transport
- * @output Message observation uploads, contact snapshots, Action Outbox sends, and source-bound transfer acceptance
+ * @output Message observation uploads, contact snapshots, Action Outbox sends, and source-bound transfer acceptance/decline
  * @position Central Android module runtime that bridges WeChat internals with the gateway service
  * @auto-doc Update header and folder INDEX.md when this file changes
  */
@@ -4681,6 +4681,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
         if ("transfer_accept".equals(dispatchItem.kind)) {
             return sendTransferAcceptAction(config, classLoader, dispatchItem.item);
         }
+        if ("transfer_decline".equals(dispatchItem.kind)) {
+            return sendTransferDeclineAction(config, classLoader, dispatchItem.item);
+        }
         if (isBlank(dispatchItem.wxid)) {
             return SendResult.failed("wxid is required");
         }
@@ -4776,10 +4779,66 @@ public final class HookEntry implements IXposedHookLoadPackage {
             if (!isBlank(transfer.receiverWxid) && !isBlank(currentWxid) && !currentWxid.equals(transfer.receiverWxid)) {
                 return SendResult.failed("transfer receiver does not match the current WeChat account");
             }
-            return confirmTransfer(classLoader, sourceChatRecordId, sourceSender, groupUsername, transfer);
+            return confirmTransfer(classLoader, sourceChatRecordId, sourceSender, groupUsername, transfer, "confirm");
         } catch (Throwable t) {
             log("transfer diag: accept failed: " + fullErrorChain(t));
             return SendResult.failed("transfer accept failed: " + shortError(t));
+        }
+    }
+
+    private static SendResult sendTransferDeclineAction(BridgeConfig config, ClassLoader classLoader, JSONObject item) {
+        try {
+            JSONObject payload = item.optJSONObject("payload_json");
+            long sourceChatRecordId = firstPositiveLong(
+                    item.optLong("chat_record_id", 0L),
+                    item.optLong("source_chat_record_id", 0L),
+                    payload == null ? 0L : payload.optLong("chat_record_id", 0L),
+                    payload == null ? 0L : payload.optLong("source_chat_record_id", 0L));
+            if (sourceChatRecordId <= 0L) {
+                return SendResult.failed("chat_record_id is required");
+            }
+            Object db = ensureMessageDatabase(config);
+            if (db == null) {
+                return SendResult.failed("WeChat message database is not available for transfer lookup");
+            }
+            ChatHistorySource source = loadChatHistorySource(db, sourceChatRecordId);
+            if (source == null) {
+                return SendResult.failed("source transfer message was not found in local WeChat message database");
+            }
+            if (source.isSend != 0) {
+                return SendResult.failed("source_chat_record_id must be an inbound transfer");
+            }
+            String transferXML = normalizeMessageContent(source.talker, source.content, source.type);
+            TransferMessageParser.Result transfer = TransferMessageParser.parse(transferXML);
+            boolean transferType = source.type == MESSAGE_TYPE_TRANSFER
+                    || (source.type == MESSAGE_TYPE_APPMSG && transfer.appMsgType == TransferMessageParser.APPMSG_TYPE_TRANSFER);
+            if (!transferType || !transfer.isTransfer()) {
+                return SendResult.failed("source_chat_record_id is not a transfer message");
+            }
+            if (!transfer.isPending()) {
+                return SendResult.failed("transfer is not pending: " + transfer.state);
+            }
+            if (!transfer.hasConfirmFields()) {
+                log("transfer confirm fields missing xmlLength=" + transferXML.length()
+                        + " tags=" + xmlElementNames(transferXML));
+                return SendResult.failed("transfer message is missing confirm identifiers or amount");
+            }
+            String groupUsername = isChatroomTalker(source.talker) ? source.talker : "";
+            String sourceSender = isBlank(groupUsername) ? source.talker : extractChatroomSender(source.content);
+            if (isBlank(sourceSender)) {
+                return SendResult.failed("transfer sender cannot be resolved from the source message");
+            }
+            if (!isBlank(transfer.payerWxid) && !sourceSender.equals(transfer.payerWxid)) {
+                return SendResult.failed("transfer payer does not match the source message sender");
+            }
+            String currentWxid = firstNonBlank(CURRENT_WXID, config == null ? "" : config.selfWxid);
+            if (!isBlank(transfer.receiverWxid) && !isBlank(currentWxid) && !currentWxid.equals(transfer.receiverWxid)) {
+                return SendResult.failed("transfer receiver does not match the current WeChat account");
+            }
+            return confirmTransfer(classLoader, sourceChatRecordId, sourceSender, groupUsername, transfer, "refuse");
+        } catch (Throwable t) {
+            log("transfer diag: decline failed: " + fullErrorChain(t));
+            return SendResult.failed("transfer decline failed: " + shortError(t));
         }
     }
 
@@ -4788,7 +4847,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
             long sourceChatRecordId,
             String sourceSender,
             String groupUsername,
-            TransferMessageParser.Result transfer) throws Exception {
+            TransferMessageParser.Result transfer,
+            String operation) throws Exception {
         // z2/m1's Kernel-readiness state is per-ClassLoader; WeChat's Tinker hot-patch
         // loads a second copy of these classes under a different loader (see
         // runtimeClassLoader()'s isPatchedWeChatLoader preference). Resolving here,
@@ -4805,6 +4865,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
             log("transfer pre-confirm query unavailable: " + fullErrorChain(t));
         }
         if (initialStatus == 2001) {
+            if ("refuse".equals(operation)) {
+                return SendResult.failed("transfer was already received; it can no longer be declined");
+            }
             log("transfer already accepted before confirm source_chat_record_id=" + sourceChatRecordId);
             return SendResult.sent(sourceChatRecordId);
         }
@@ -4833,7 +4896,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 transfer.transactionId,
                 transfer.transferId,
                 (int) transfer.amountMinor,
-                "confirm",
+                operation,
                 sourceSender,
                 transfer.invalidTime,
                 groupUsername,
@@ -4858,6 +4921,16 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
 
         int status = queryTransferStatus(classLoader, transfer, groupUsername);
+        if ("refuse".equals(operation)) {
+            if (status != 2001 && isTerminalTransferStatus(status)) {
+                log("transfer declined source_chat_record_id=" + sourceChatRecordId
+                        + " amount_minor=" + transfer.amountMinor
+                        + " currency=" + transfer.currency
+                        + " status=" + status);
+                return SendResult.sent(sourceChatRecordId);
+            }
+            return SendResult.failed("transfer decline was not verified: status=" + status);
+        }
         if (status == 2001) {
             log("transfer accepted source_chat_record_id=" + sourceChatRecordId
                     + " amount_minor=" + transfer.amountMinor

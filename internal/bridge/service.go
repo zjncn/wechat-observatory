@@ -711,6 +711,13 @@ func (s *Service) AckOutbox(ctx context.Context, req ModuleAckRequest) ([]Module
 			}
 			continue
 		}
+		if isTransferDeclineOutboxItem(item) {
+			if ack.ChatRecordID > 0 && s.persistence != nil {
+				ownerWxID := firstNonEmpty(item.OwnerWxID, s.deviceWxID(item.Device))
+				_ = s.persistence.MarkTransferDeclined(ctx, item.Device, ownerWxID, ack.ChatRecordID)
+			}
+			continue
+		}
 		if isRevokeOutboxItem(item) {
 			continue
 		}
@@ -1132,6 +1139,10 @@ func isRevokeOutboxItem(item ModuleOutboxItem) bool {
 
 func isTransferAcceptOutboxItem(item ModuleOutboxItem) bool {
 	return item.Kind == OutboxKindTransferAccept
+}
+
+func isTransferDeclineOutboxItem(item ModuleOutboxItem) bool {
+	return item.Kind == OutboxKindTransferDecline
 }
 
 func isMiniProgramOutboxItem(item ModuleOutboxItem) bool {
