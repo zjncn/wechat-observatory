@@ -477,10 +477,16 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return;
         }
         try {
-            Class<?> appContextClass = findClass(classLoader, "com.tencent.mm.sdk.platformtools.x2");
+            // WeChat 8.0.78 reassigned "x2" to an unrelated class and renamed the
+            // real MMApplicationContext holder to "a3" (setter method "u" -> "w").
+            Class<?> appContextClass = findClassWithField(
+                    classLoader,
+                    new String[]{"com.tencent.mm.sdk.platformtools.x2", "com.tencent.mm.sdk.platformtools.a3"},
+                    "f210311a", "a");
             Field field = findFieldAny(appContextClass, "f210311a", "a");
             if (field.get(null) == null) {
-                findMethod(appContextClass, "u", Context.class).invoke(null, context);
+                Method setter = findMethodAny(appContextClass, new Class<?>[]{Context.class}, "u", "w");
+                setter.invoke(null, context);
                 log("initialized WeChat MMApplicationContext early from lifecycle hook");
             }
         } catch (Throwable t) {
@@ -509,7 +515,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 return;
             }
 
-            Class<?> setupClass = findClass(classLoader, "com.tencent.mm.app.u5");
+            // WeChat 8.0.78 reassigned "u5" to an unrelated enum and renamed the
+            // real SetupBaseBuildInfo entry point to "b6" (method name "a" unchanged).
+            Class<?> setupClass = findClassWithMethod(
+                    classLoader,
+                    new String[]{"com.tencent.mm.app.u5", "com.tencent.mm.app.b6"},
+                    "a", Context.class);
             findMethod(setupClass, "a", Context.class).invoke(null, context);
             Object initializedValue = clientVersionField.get(null);
             if (!isDecodableInteger(initializedValue)) {
@@ -699,6 +710,22 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return constructor.newInstance(args);
         }
 
+        // The allocateXposedObject bypass below exists specifically for the
+        // Tenpay-JNI-crashes-in-cloned-profiles bug seen on the sjmyzq device
+        // (Android 16 dual-instance). LSPosed v2.2.0 (seen on phone-a with
+        // WeChat 8.0.78) no longer exposes HookBridge to a module's own
+        // ClassLoader the way earlier LSPosed builds did, and phone-a is not a
+        // cloned-profile device, so try the real constructor first -- it is
+        // very likely fine here -- and only fall back to the allocate-and-
+        // reproduce-the-constructor hack if that genuinely fails the way it
+        // did on the original bug device.
+        try {
+            return constructor.newInstance(args);
+        } catch (Throwable directConstructionFailure) {
+            log("transfer scene direct construction failed, falling back to allocate+reproduce: "
+                    + shortError(directConstructionFailure));
+        }
+
         Object scene = allocateXposedObject(sceneClass);
         initializeTransferSceneDefaults(scene);
         Map<String, String> request = new HashMap<>();
@@ -715,17 +742,49 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static Object allocateXposedObject(Class<?> targetClass) throws Exception {
-        ClassLoader bridgeLoader = XposedBridge.class.getClassLoader();
-        Class<?> hookBridge = Class.forName(
-                "org.lsposed.lspd.core.nativebridge.HookBridge",
-                false,
-                bridgeLoader);
+        Class<?> hookBridge = findHookBridgeClass();
         Object allocated = findMethod(hookBridge, "allocateObject", Class.class)
                 .invoke(null, targetClass);
         if (allocated == null) {
             throw new IllegalStateException("LSPosed failed to allocate " + targetClass.getName());
         }
         return allocated;
+    }
+
+    /**
+     * Per handoff doc: on LSPosed v2.2.0 (seen on phone-a with WeChat 8.0.78),
+     * none of these candidate ClassLoaders can see
+     * org.lsposed.lspd.core.nativebridge.HookBridge the way earlier LSPosed
+     * builds exposed it to a module's own ClassLoader -- this module's
+     * ClassLoader (real runtime class name "n1") only has its own dex in its
+     * DexPathList, with no reference to whatever ClassLoader holds the
+     * framework's internal implementation classes. allocateXposedObject is
+     * only reached as a fallback now (see newTransferSceneWithJavaSignature),
+     * for devices where direct construction still crashes the way it did on
+     * the original sjmyzq bug device, so this keeps trying the same candidates
+     * in case a future LSPosed build (or a different module/Xposed
+     * implementation) does expose it through one of them.
+     */
+    private static Class<?> findHookBridgeClass() throws ClassNotFoundException {
+        String className = "org.lsposed.lspd.core.nativebridge.HookBridge";
+        ClassLoader[] candidates = {
+                XposedBridge.class.getClassLoader(),
+                HookEntry.class.getClassLoader(),
+                ClassLoader.getSystemClassLoader(),
+                Thread.currentThread().getContextClassLoader(),
+        };
+        ClassNotFoundException lastError = null;
+        for (ClassLoader candidate : candidates) {
+            if (candidate == null) {
+                continue;
+            }
+            try {
+                return Class.forName(className, false, candidate);
+            } catch (ClassNotFoundException e) {
+                lastError = e;
+            }
+        }
+        throw lastError != null ? lastError : new ClassNotFoundException(className);
     }
 
     /**
@@ -1430,7 +1489,16 @@ public final class HookEntry implements IXposedHookLoadPackage {
             ClassLoader classLoader,
             WeChatVersionSymbols.Profile symbols) throws Exception {
         classLoader = runtimeClassLoader(classLoader);
-        Class<?> appContext = findClass(classLoader, "com.tencent.mm.sdk.platformtools.x2");
+        // See ensureAppContextField's comment: "x2" was reassigned to an unrelated
+        // class in WeChat 8.0.78, with the real holder renamed to "a3" (setter
+        // method "u" -> "w"). findClassWithField's static-field check exists
+        // precisely because 8.0.78's "x2" happens to have its own unrelated
+        // same-named instance field "a", which a bare name lookup would wrongly
+        // accept and then crash on with "null receiver".
+        Class<?> appContext = findClassWithField(
+                classLoader,
+                new String[]{"com.tencent.mm.sdk.platformtools.x2", "com.tencent.mm.sdk.platformtools.a3"},
+                "f210311a", "a");
         Object application = findFieldAny(appContext, "f210311a", "a").get(null);
         if (application == null) {
             application = currentApplication();
@@ -1440,7 +1508,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return;
         }
         if (findFieldAny(appContext, "f210311a", "a").get(null) == null) {
-            findMethod(appContext, "u", Context.class).invoke(null, application);
+            findMethodAny(appContext, new Class<?>[]{Context.class}, "u", "w").invoke(null, application);
             log("initialized WeChat MMApplicationContext from module");
         }
 
@@ -2271,18 +2339,34 @@ public final class HookEntry implements IXposedHookLoadPackage {
         if (storage == null) {
             return null;
         }
+        // These two lookups (by msgSvrId vs. by local recordId) were hardcoded
+        // as "K2"/"A2" without ever going through WeChatVersionSymbols, and
+        // that pair could not even be found on the 8.0.77 class this was
+        // supposedly written against -- this path was never actually
+        // exercised before. WeChat 8.0.78's class has exactly one pair of
+        // same-signature (String,long) methods that plausibly match ("F3" and
+        // "x3"); try both orderings per lookup so this self-corrects if the
+        // guessed pairing is backwards.
         Object model = null;
         if (msgSvrId != null && msgSvrId > 0L) {
-            model = findMethod(storage.getClass(), "K2", String.class, long.class)
-                    .invoke(storage, talker, msgSvrId.longValue());
+            model = invokeFirstWorking(storage, new String[]{"K2", "F3", "x3"}, talker, msgSvrId.longValue());
         }
         ImageInfoRecord record = imageInfoFromWechatModel(model);
         if ((record == null || record.id <= 0L) && recordId > 0L) {
-            model = findMethod(storage.getClass(), "A2", String.class, long.class)
-                    .invoke(storage, talker, recordId);
+            model = invokeFirstWorking(storage, new String[]{"A2", "x3", "F3"}, talker, recordId);
             record = imageInfoFromWechatModel(model);
         }
         return record;
+    }
+
+    private static Object invokeFirstWorking(Object target, String[] methodNames, String arg0, long arg1) {
+        for (String name : methodNames) {
+            try {
+                return findMethod(target.getClass(), name, String.class, long.class).invoke(target, arg0, arg1);
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
     }
 
     private static ImageInfoRecord imageInfoByIdFromWechatStorage(ClassLoader classLoader, long imageInfoId)
@@ -6514,13 +6598,40 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static boolean revokeViaRevokeMsgEvent(ClassLoader classLoader, RevokeSource source) throws Exception {
         boolean preferImage = isImageLikeMessageType(source == null ? 0 : source.type);
-        if (publishRevokeMsgEvent(classLoader, source, preferImage)) {
+        Object messageRecord = null;
+        try {
+            messageRecord = lookupMessageRecord(classLoader, source);
+        } catch (Throwable t) {
+            log("revoke message record lookup failed, payload's message-record fields will stay null: " + shortError(t));
+        }
+        if (publishRevokeMsgEvent(classLoader, source, preferImage, messageRecord)) {
             return true;
         }
-        return publishRevokeMsgEvent(classLoader, source, !preferImage);
+        return publishRevokeMsgEvent(classLoader, source, !preferImage, messageRecord);
     }
 
-    private static boolean publishRevokeMsgEvent(ClassLoader classLoader, RevokeSource source, boolean isImage) throws Exception {
+    /**
+     * Per handoff doc: RevokeMsgEvent's payload class (baseline "fm.fs") holds
+     * two com.tencent.mm.storage.f9 (message row) fields that applyRevokePayload
+     * never filled in -- WeChat's own revoke handler dereferences one of these
+     * to look up the message's content/wording and crashes with a
+     * NullPointerException when it is null. This is not new in 8.0.78; the
+     * bug just never showed up before because revoke was never exercised this
+     * thoroughly. Reuse the existing message-lookup entry point (baseline
+     * "qt0.k0" / imageMessageLookup) that the image-path code already relies
+     * on to fetch a fully-populated message row object for these fields.
+     */
+    private static Object lookupMessageRecord(ClassLoader classLoader, RevokeSource source) throws Exception {
+        if (source == null || isBlank(source.talker) || source.msgId <= 0L) {
+            return null;
+        }
+        WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
+        Class<?> messageStorageClass = findVersionedClass(classLoader, "qt0.k0");
+        return findMethod(messageStorageClass, symbols.methods.imageMessageLookup, String.class, long.class)
+                .invoke(null, source.talker, source.msgId);
+    }
+
+    private static boolean publishRevokeMsgEvent(ClassLoader classLoader, RevokeSource source, boolean isImage, Object messageRecord) throws Exception {
         try {
             Class<?> eventClass = findClass(classLoader, "com.tencent.mm.autogen.events.RevokeMsgEvent");
             if (eventClass == null) {
@@ -6531,8 +6642,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
             if (payload == null) {
                 throw new IllegalStateException("RevokeMsgEvent payload is unavailable");
             }
-            log("publishRevokeMsgEvent payloadClass=" + payload.getClass().getName() + " isImage=" + isImage);
-            applyRevokePayload(payload, source, isImage);
+            log("publishRevokeMsgEvent payloadClass=" + payload.getClass().getName() + " isImage=" + isImage
+                    + " messageRecord=" + (messageRecord == null ? "null" : messageRecord.getClass().getName()));
+            applyRevokePayload(payload, source, isImage, messageRecord);
             Method eMethod = findNoArgMethod(event.getClass(), "e");
             if (eMethod == null) {
                 throw new NoSuchMethodException("RevokeMsgEvent.e() not found");
@@ -6683,12 +6795,33 @@ public final class HookEntry implements IXposedHookLoadPackage {
         if (plugin == null) {
             throw new IllegalStateException("msgquote plugin service is unavailable");
         }
-        Object storage = findNoArgMethod(plugin.getClass(), symbols.methods.quoteStorage).invoke(plugin);
+        Object storage;
+        try {
+            storage = findNoArgMethod(plugin.getClass(), symbols.methods.quoteStorage).invoke(plugin);
+        } catch (NoSuchMethodException e) {
+            // WeChat 8.0.78 restructured this plugin from "instance method
+            // returns the storage object" into a static-factory shape (the
+            // plugin class itself exposes static getters for its fields
+            // instead). Try the static getter that structurally matches the
+            // old storage object's role (same superclass lineage as the
+            // pre-8.0.78 "sn3.a" storage type).
+            Method staticGetter = findMethod(plugin.getClass(), "cj");
+            if (!Modifier.isStatic(staticGetter.getModifiers())) {
+                throw e;
+            }
+            storage = staticGetter.invoke(null);
+        }
         if (storage == null) {
             throw new IllegalStateException("MsgQuote storage is unavailable");
         }
 
-        Class<?> recordClass = findVersionedClass(classLoader, "ui3.b");
+        // "ui3.b" (baseline; 8.0.77 real name "sn3.b") is a bare, empty
+        // subclass of "im.e8" that adds nothing of its own beyond clone()/
+        // toString() -- every field this code actually sets (field_msgId
+        // etc.) lives on "im.e8" itself, and that class's own name and field
+        // layout is unchanged across 8.0.77/8.0.78. Construct "im.e8"
+        // directly instead of chasing the unstable short-named subclass.
+        Class<?> recordClass = findClass(classLoader, "im.e8");
         Object record = recordClass.getDeclaredConstructor().newInstance();
         setLongFieldAny(record, newMsgId, "field_msgId");
         setLongFieldAny(record, source.msgId, "field_quotedMsgId");
@@ -7058,15 +7191,35 @@ public final class HookEntry implements IXposedHookLoadPackage {
         Class<?> paramsClass = findVersionedClass(classLoader, "y80.q1");
         Constructor<?> paramsCtor = findConstructor(paramsClass, String.class);
         Object params = paramsCtor.newInstance(wxid);
-        setDoubleFieldAny(params, latitude, "d");
-        setDoubleFieldAny(params, longitude, "e");
-        setIntFieldAny(params, scale, "f");
-        setObjectField(params, label == null ? "" : label, "g");
-        setObjectField(params, poiName == null ? "" : poiName, "h");
-        setObjectField(params, infoURL == null ? "" : infoURL, "i");
-        setObjectField(params, poiID == null ? "" : poiID, "j");
-        setBooleanFieldAny(params, fromPoiList, "k");
-        setObjectField(params, poiTips == null ? "" : poiTips, "l");
+        // WeChat 8.0.78 inserted a new non-primitive field "d" into this class
+        // (baseline "y80.q1", 8.0.77 name "na0.t1", 8.0.78 name "kb0.t1"), which
+        // shifted every field below it one letter over. A naive "try candidate
+        // A then candidate B" per field is NOT safe here because consecutive
+        // fields' candidate lists overlap (e.g. latitude tries "d" then "e",
+        // longitude tries "e" then "f") -- on the 8.0.78 layout latitude's
+        // first candidate "d" is skipped (wrong type) so it lands on "e", then
+        // longitude's own first candidate is also "e" and silently overwrites
+        // the latitude value that was just set. Detect the layout once up
+        // front instead, then assign each field by its one correct name.
+        boolean legacyFieldLayout = isFieldOfType(params, "d", double.class);
+        String latitudeField = legacyFieldLayout ? "d" : "e";
+        String longitudeField = legacyFieldLayout ? "e" : "f";
+        String scaleField = legacyFieldLayout ? "f" : "g";
+        String labelField = legacyFieldLayout ? "g" : "h";
+        String poiNameField = legacyFieldLayout ? "h" : "i";
+        String infoURLField = legacyFieldLayout ? "i" : "j";
+        String poiIDField = legacyFieldLayout ? "j" : "k";
+        String fromPoiListField = legacyFieldLayout ? "k" : "l";
+        String poiTipsField = legacyFieldLayout ? "l" : "m";
+        setDoubleFieldAny(params, latitude, latitudeField);
+        setDoubleFieldAny(params, longitude, longitudeField);
+        setIntFieldAny(params, scale, scaleField);
+        setObjectField(params, label == null ? "" : label, labelField);
+        setObjectField(params, poiName == null ? "" : poiName, poiNameField);
+        setObjectField(params, infoURL == null ? "" : infoURL, infoURLField);
+        setObjectField(params, poiID == null ? "" : poiID, poiIDField);
+        setBooleanFieldAny(params, fromPoiList, fromPoiListField);
+        setObjectField(params, poiTips == null ? "" : poiTips, poiTipsField);
 
         Method getService = findMethod(findVersionedClass(classLoader, "i95.n0"), "c", Class.class);
         Object service = getService.invoke(null, findVersionedClass(classLoader, "z80.h0"));
@@ -8001,8 +8154,18 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static long sendViaNetScene(ClassLoader classLoader, String wxid, String text, int msgType) throws Exception {
         Class<?> netSceneClass = findVersionedClass(classLoader, "w11.r0");
-        Constructor<?> ctor = findConstructor(netSceneClass, String.class, String.class, int.class, int.class, long.class);
-        Object scene = ctor.newInstance(wxid, text, msgType, 4, 0L);
+        // WeChat 8.0.78's (String,String,int,int,long) constructor picked up a
+        // trailing String parameter that 8.0.77 didn't have. Try the new
+        // 8.0.78 shape first and fall back to the old one so this keeps
+        // working on either version.
+        Object scene;
+        try {
+            Constructor<?> ctor = findConstructor(netSceneClass, String.class, String.class, int.class, int.class, long.class, String.class);
+            scene = ctor.newInstance(wxid, text, msgType, 4, 0L, "");
+        } catch (NoSuchMethodException e) {
+            Constructor<?> ctor = findConstructor(netSceneClass, String.class, String.class, int.class, int.class, long.class);
+            scene = ctor.newInstance(wxid, text, msgType, 4, 0L);
+        }
         long msgId = getLongField(scene, "f459357f", "f");
         if (msgId == -1L) {
             throw new IllegalStateException("w11.r0 inserted local msg failed");
@@ -8053,7 +8216,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
         findMethod(builder.getClass(), "g", String.class).invoke(builder, wxid);
         findMethod(builder.getClass(), "e", String.class).invoke(builder, text);
-        findMethod(builder.getClass(), "h", int.class).invoke(builder, msgType);
+        // WeChat 8.0.78 added a new h(String) setter on this builder, pushing
+        // the existing int setter from "h" to "i".
+        findMethodAny(builder.getClass(), new Class<?>[]{int.class}, "h", "i").invoke(builder, msgType);
         if (forwardInfo == null) {
             setForwardInfo(classLoader, builder);
         } else {
@@ -8149,9 +8314,23 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return null;
     }
 
-    private static void applyRevokePayload(Object payload, RevokeSource source, boolean isImage) throws Exception {
+    private static void applyRevokePayload(Object payload, RevokeSource source, boolean isImage, Object messageRecord) throws Exception {
         if (payload == null || source == null) {
             throw new IllegalArgumentException("revoke payload and source are required");
+        }
+        if (messageRecord != null) {
+            // messageRecord's runtime class can be a subclass of the field's
+            // declared type, so this needs an assignability check rather than
+            // collectInstanceFieldsByType's exact-type match.
+            for (Class<?> current = payload.getClass(); current != null && current != Object.class; current = current.getSuperclass()) {
+                for (Field field : current.getDeclaredFields()) {
+                    if (Modifier.isStatic(field.getModifiers()) || !field.getType().isInstance(messageRecord)) {
+                        continue;
+                    }
+                    field.setAccessible(true);
+                    field.set(payload, messageRecord);
+                }
+            }
         }
         List<Field> stringFields = collectInstanceFieldsByType(payload.getClass(), String.class);
         List<Field> longFields = collectNumericInstanceFields(payload.getClass(), true);
@@ -8164,11 +8343,17 @@ public final class HookEntry implements IXposedHookLoadPackage {
         if (stringFields.size() > 1) {
             stringFields.get(1).set(payload, String.valueOf(source.msgId));
         }
+        // WeChat 8.0.78's revoke handler range-checks whichever long field it
+        // treats as the local "msgId" and rejects it if it looks like a large
+        // msgSvrId-shaped number ("not in the reasonable scope") -- so the
+        // small local msgId has to go in the first long field and the large
+        // server-assigned msgSvrId in the second, the opposite of what this
+        // code assumed before it was actually exercised against a real device.
         if (longFields.size() > 0) {
-            setLongFieldValue(longFields.get(0), payload, firstPositiveLong(source.msgSvrId, source.msgId));
+            setLongFieldValue(longFields.get(0), payload, source.msgId);
         }
         if (longFields.size() > 1) {
-            setLongFieldValue(longFields.get(1), payload, source.msgId);
+            setLongFieldValue(longFields.get(1), payload, firstPositiveLong(source.msgSvrId, source.msgId));
         }
         if (longFields.size() > 2) {
             setLongFieldValue(longFields.get(2), payload, source.createTime);
@@ -8271,6 +8456,57 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return Class.forName(name, false, classLoader);
     }
 
+    /**
+     * WeChat's R8 obfuscation reassigns short class names on every release build,
+     * so a class name that is stable across one version bump can be reused for a
+     * completely unrelated class in the next one (WeChat 8.0.78 renamed
+     * platformtools.x2 to a3 and app.u5 to b6, while the old names got reassigned
+     * to unrelated classes instead of simply disappearing). A plain candidate-name
+     * loop that only checks ClassNotFoundException would silently resolve to the
+     * wrong class in that case, so each candidate class name is paired with a
+     * member name that must also resolve on it before it is accepted.
+     */
+    private static Class<?> findClassWithField(ClassLoader classLoader, String[] classCandidates, String... fieldCandidates) throws Exception {
+        Exception lastError = null;
+        for (String className : classCandidates) {
+            try {
+                Class<?> cls = findClass(classLoader, className);
+                Field field = findFieldAny(cls, fieldCandidates);
+                // A same-named field existing on an unrelated, R8-reassigned class is
+                // exactly the trap this method exists to avoid (WeChat 8.0.78's "x2"
+                // has an unrelated instance field "a", which a bare existence check
+                // would happily accept). Callers always read these fields with
+                // field.get(null), so require the match to actually be static.
+                if (!java.lang.reflect.Modifier.isStatic(field.getModifiers())) {
+                    lastError = new NoSuchFieldException(className + " field " + field.getName() + " is not static");
+                    continue;
+                }
+                return cls;
+            } catch (Exception e) {
+                lastError = e;
+            }
+        }
+        throw lastError != null ? lastError : new ClassNotFoundException("no candidate names given");
+    }
+
+    private static Class<?> findClassWithMethod(ClassLoader classLoader, String[] classCandidates, String methodName, Class<?>... paramTypes) throws Exception {
+        Exception lastError = null;
+        for (String className : classCandidates) {
+            try {
+                Class<?> cls = findClass(classLoader, className);
+                Method method = findMethod(cls, methodName, paramTypes);
+                if (!java.lang.reflect.Modifier.isStatic(method.getModifiers())) {
+                    lastError = new NoSuchMethodException(className + " method " + method.getName() + " is not static");
+                    continue;
+                }
+                return cls;
+            } catch (Exception e) {
+                lastError = e;
+            }
+        }
+        throw lastError != null ? lastError : new ClassNotFoundException("no candidate names given");
+    }
+
     private static Object newInstanceAny(Class<?> cls) throws Exception {
         try {
             Constructor<?> ctor = cls.getDeclaredConstructor();
@@ -8368,29 +8604,82 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * A name-only field lookup like findFieldAny is not safe for "try the 8.0.77
+     * name, then the 8.0.78 name" fallbacks: WeChat 8.0.78 inserted a new
+     * non-primitive field into com.tencent.mm.plugin.remittance... (baseline
+     * "y80.q1"/kb0.t1)'s location params class, shifting every later field one
+     * letter over. That means an 8.0.77 candidate name can still exist in 8.0.78,
+     * just renamed to hold something of the wrong type (e.g. the old latitude
+     * field "d" now holds an unrelated object), so the first candidate that
+     * merely *exists* would be wrongly accepted and blow up on the type
+     * mismatch instead of falling through to the next candidate. These helpers
+     * therefore try every candidate name and only give up after all of them
+     * fail (whether by missing name or by type mismatch).
+     */
     private static void setIntFieldAny(Object target, int value, String... names) throws Exception {
-        Field field = findFieldAny(target.getClass(), names);
-        field.setInt(target, value);
+        Exception last = null;
+        for (String name : names) {
+            try {
+                findField(target.getClass(), name).setInt(target, value);
+                return;
+            } catch (Exception e) {
+                last = e;
+            }
+        }
+        throw last != null ? last : new NoSuchFieldException(joinNames(names));
     }
 
     private static void setLongFieldAny(Object target, long value, String... names) throws Exception {
-        Field field = findFieldAny(target.getClass(), names);
-        field.setLong(target, value);
+        Exception last = null;
+        for (String name : names) {
+            try {
+                findField(target.getClass(), name).setLong(target, value);
+                return;
+            } catch (Exception e) {
+                last = e;
+            }
+        }
+        throw last != null ? last : new NoSuchFieldException(joinNames(names));
     }
 
     private static void setDoubleFieldAny(Object target, double value, String... names) throws Exception {
-        Field field = findFieldAny(target.getClass(), names);
-        field.setDouble(target, value);
+        Exception last = null;
+        for (String name : names) {
+            try {
+                findField(target.getClass(), name).setDouble(target, value);
+                return;
+            } catch (Exception e) {
+                last = e;
+            }
+        }
+        throw last != null ? last : new NoSuchFieldException(joinNames(names));
     }
 
     private static void setBooleanFieldAny(Object target, boolean value, String... names) throws Exception {
-        Field field = findFieldAny(target.getClass(), names);
-        field.setBoolean(target, value);
+        Exception last = null;
+        for (String name : names) {
+            try {
+                findField(target.getClass(), name).setBoolean(target, value);
+                return;
+            } catch (Exception e) {
+                last = e;
+            }
+        }
+        throw last != null ? last : new NoSuchFieldException(joinNames(names));
     }
 
     private static void setObjectField(Object target, Object value, String... names) throws Exception {
-        Field field = findFieldAny(target.getClass(), names);
-        field.set(target, value);
+        Exception last = null;
+        for (String name : names) {
+            try {
+                findField(target.getClass(), name).set(target, value);
+                return;
+            } catch (Exception e) {
+                last = e;
+            }
+        }
+        throw last != null ? last : new NoSuchFieldException(joinNames(names));
     }
 
     private static Field findFieldAny(Class<?> cls, String... names) throws NoSuchFieldException {
@@ -8403,6 +8692,18 @@ public final class HookEntry implements IXposedHookLoadPackage {
             }
         }
         throw last == null ? new NoSuchFieldException("") : last;
+    }
+
+    private static Method findMethodAny(Class<?> cls, Class<?>[] parameterTypes, String... names) throws NoSuchMethodException {
+        NoSuchMethodException last = null;
+        for (String name : names) {
+            try {
+                return findMethod(cls, name, parameterTypes);
+            } catch (NoSuchMethodException e) {
+                last = e;
+            }
+        }
+        throw last == null ? new NoSuchMethodException("") : last;
     }
 
     private static long getLongField(Object target, String... names) throws Exception {
@@ -8466,6 +8767,14 @@ public final class HookEntry implements IXposedHookLoadPackage {
             }
         }
         throw new NoSuchFieldException(name);
+    }
+
+    private static boolean isFieldOfType(Object target, String name, Class<?> type) {
+        try {
+            return findField(target.getClass(), name).getType() == type;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     private static String postJson(BridgeConfig config, String path, String bodyJson) throws Exception {

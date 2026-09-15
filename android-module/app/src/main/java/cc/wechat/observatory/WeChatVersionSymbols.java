@@ -249,10 +249,81 @@ final class WeChatVersionSymbols {
                     "com.tencent.mm.vfs.w6", "com.tencent.mm.vfs.a7",
                     "com.tencent.mm.storage.f9", "com.tencent.mm.storage.e9"));
 
+    /**
+     * WeChat 8.0.78's R8 build reassigned every short class name from 8.0.77 to a
+     * different (often unrelated) class instead of keeping any of them stable, so
+     * this profile is seeded from WECHAT_8077's aliases as a starting point rather
+     * than a verified mapping. Only the two resolve() probe classes below
+     * ("i95.n0" -> ph5.n0, "w11.r0" -> v51.r0) have been re-located and confirmed
+     * structurally (same field/method shapes) via androguard against the real
+     * 8.0.78 dex; every other alias, method name and field name copied from
+     * WECHAT_8077 is unverified for 8.0.78 and should be treated as a placeholder
+     * to be corrected the first time the feature that uses it is exercised and
+     * fails (same error-driven approach used for the earlier 8.0.76/8.0.77 work).
+     */
+    private static final Profile WECHAT_8078 = new Profile(
+            "8.0.78",
+            false,
+            false,
+            true,
+            true,
+            true,
+            methods("Wi", "Ej", "ej", "fj", "k2", "bj", "cj", "ij", "kj", "lj", "pj", "fj", "jj", "lj"),
+            fields("x2", "i0", "k2", "j2", "l2", "C2", "t2", "B2", "m2"),
+            aliases(
+                    "i95.n0", "ph5.n0",
+                    "i95.y", "ph5.y",
+                    "k95.a", "rh5.a",
+                    "w11.r0", "v51.r0",
+                    "w11.s1", "v51.s1",
+                    "aq1.l", "vu1.l",
+                    "c01.e2", "b41.d2",
+                    "c01.f7", "b41.i7",
+                    "c01.h7", "b41.k7",
+                    "c01.ia", "u21.ba",
+                    "aa0.e", "rb0.e",
+                    "ui3.b", "sn3.b",
+                    "ot0.q", "dx0.r",
+                    "tg3.u0", "rn3.u0",
+                    "bm5.y", "ou5.x",
+                    "bm5.f0", "ou5.e0",
+                    "oi3.g", "sp3.g",
+                    "cg0.d", "xi0.d",
+                    "dg0.f", "yi0.f",
+                    "qi3.b0", "up3.c0",
+                    "qi3.x", "up3.y",
+                    "ut.s0", "gu.q0",
+                    "dk5.w", "qs5.w",
+                    "vf0.r2", "qi0.t2",
+                    "vf0.u2", "qi0.w2",
+                    "vf0.i3", "qi0.k3",
+                    "vf0.h3", "qi0.j3",
+                    "vf0.p2", "qi0.r2",
+                    "wf0.b2", "ri0.b2",
+                    "y80.q1", "kb0.t1",
+                    "z80.h0", "lb0.h0",
+                    "y80.p0", "kb0.p0",
+                    "r45.uf6", "pc5.qn6",
+                    "r45.vh4", "pc5.qn4",
+                    "r45.xz6", "pc5.p87",
+                    "r15.b", "p95.d",
+                    "r15.d", "p95.f",
+                    "qh3.a1", "rn3.a1",
+                    "jg0.x", "fj0.x",
+                    "h70.y", "w90.y",
+                    "h70.w", "w90.w",
+                    "qt0.k0", "ex0.k0",
+                    "com.tencent.mm.vfs.w6", "com.tencent.mm.vfs.a7",
+                    "com.tencent.mm.storage.f9", "com.tencent.mm.storage.e9"));
+
     private WeChatVersionSymbols() {
     }
 
     static Profile resolve(ClassProbe probe) {
+        if (probe.isPresent(WECHAT_8078.className("i95.n0"))
+                && probe.isPresent(WECHAT_8078.className("w11.r0"))) {
+            return WECHAT_8078;
+        }
         if (probe.isPresent(WECHAT_8077.className("i95.n0"))
                 && probe.isPresent(WECHAT_8077.className("w11.r0"))) {
             return WECHAT_8077;
