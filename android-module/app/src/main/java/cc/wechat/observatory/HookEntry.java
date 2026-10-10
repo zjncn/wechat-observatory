@@ -139,6 +139,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final Set<Long> MEDIA_RETRY_SCHEDULED_IDS = new HashSet<>();
     private static final Set<Long> MEDIA_UPLOAD_REPORTED_IDS = new HashSet<>();
     private static final Set<Long> ORIGINAL_IMAGE_DOWNLOAD_DISPATCHED_IDS = new HashSet<>();
+    private static final Set<Long> VOICE_DOWNLOAD_DISPATCHED_IDS = new HashSet<>();
+    private static final Set<Long> VIDEO_DOWNLOAD_DISPATCHED_IDS = new HashSet<>();
     private static final Map<Long, String> ORIGINAL_IMAGE_DOWNLOADED_PATHS = new LinkedHashMap<>();
     private static final Set<Long> ORIGINAL_IMAGE_DIAGNOSTIC_REPORTED_IDS = new HashSet<>();
     private static final Set<String> EMOJI_INFO_DIAGNOSTIC_REPORTED_MD5 = new HashSet<>();
@@ -263,6 +265,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             if (mainProcess) {
                 hookApplicationAttach(lpparam.classLoader);
                 hookWeChatApplication(lpparam.classLoader);
+                hookVoiceDownloadFinishDiagnostic(lpparam.classLoader);
             } else {
                 log("skip outbox worker in process " + lpparam.processName);
             }
@@ -339,6 +342,42 @@ public final class HookEntry implements IXposedHookLoadPackage {
             log("hooked external storage fallback");
         } catch (Throwable t) {
             log("hook external storage fallback failed: " + shortError(t));
+        }
+    }
+
+    // Diagnostic only: WeChat's own success/failure logging for voice downloads
+    // (tag "MicroMsg.VoiceDownloadTask") goes through its internal mars/xlog system, not
+    // logcat, so there is otherwise no visibility into whether a download we triggered via
+    // requestVoiceDownloadAsync ever reaches a terminal state. Hooking the generic event
+    // publish method and filtering to this one event type surfaces that outcome directly.
+    private static void hookVoiceDownloadFinishDiagnostic(ClassLoader classLoader) {
+        try {
+            Class<?> eventClass = XposedHelpers.findClass("com.tencent.mm.sdk.event.IEvent", classLoader);
+            final Class<?> targetClass = XposedHelpers.findClass(
+                    "com.tencent.mm.autogen.events.VoiceMsgDownloadFinishEvent", classLoader);
+            XposedHelpers.findAndHookMethod(eventClass, "b", Looper.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!targetClass.isInstance(param.thisObject)) {
+                        return;
+                    }
+                    try {
+                        // jadx displays these as f60594g/f275754a/f275755b/f275756c to avoid a
+                        // name collision in the decompiled source, but says so right in its own
+                        // "renamed from" comment -- the real reflective names are the short ones.
+                        Object payload = findField(param.thisObject.getClass(), "g").get(param.thisObject);
+                        long msgId = ((Number) findField(payload.getClass(), "a").get(payload)).longValue();
+                        boolean success = ((Boolean) findField(payload.getClass(), "b").get(payload)).booleanValue();
+                        boolean redownload = ((Boolean) findField(payload.getClass(), "c").get(payload)).booleanValue();
+                        log("voice download finished msgId=" + msgId + " success=" + success + " isRedownload=" + redownload);
+                    } catch (Throwable t) {
+                        log("voice download finish diagnostic failed: " + shortError(rootCause(t)));
+                    }
+                }
+            });
+            log("hooked VoiceMsgDownloadFinishEvent diagnostic");
+        } catch (Throwable t) {
+            log("hook voice download diagnostic failed: " + shortError(rootCause(t)));
         }
     }
 
@@ -558,7 +597,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             if (WALLET_PLUGIN_INITIALIZED.get()) {
                 return;
             }
-            Class<?> serviceManagerClass = findClass(classLoader, "sd5.n0");
+            Class<?> serviceManagerClass = findVersionedClass(classLoader, "i95.n0");
             Class<?> walletPluginClass = findClass(classLoader, "ni0.j2");
             Object walletPlugin = findMethod(serviceManagerClass, "c", Class.class)
                     .invoke(null, walletPluginClass);
@@ -2139,6 +2178,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
         if (type == 3) {
             requestOriginalImageDownloadAsync(recordId, msgSvrId, talker);
+        } else if (type == 34) {
+            requestVoiceDownloadAsync(recordId, msgSvrId, talker, mediaHint);
+        } else if (type == 43 || type == 62) {
+            requestVideoDownloadAsync(recordId, talker);
         }
         Thread worker = new Thread(new Runnable() {
             @Override
@@ -2180,8 +2223,13 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 }
                 if (type == 3) {
                     requestOriginalImageDownloadAsync(recordId, msgSvrId, talker);
+                } else if (type == 43 || type == 62) {
+                    requestVideoDownloadAsync(recordId, talker);
                 }
                 String latestHint = resolveMediaHint(LAST_DATABASE, type, Long.valueOf(recordId), msgSvrId, mediaHint);
+                if (type == 34) {
+                    requestVoiceDownloadAsync(recordId, msgSvrId, talker, latestHint);
+                }
                 MessagePayload payload = buildMessagePayload(config, talker, content, isSend, recordId, createTime, type, latestHint);
                 if (isBlank(payload.mediaBase64)) {
                     continue;
@@ -2328,6 +2376,148 @@ public final class HookEntry implements IXposedHookLoadPackage {
         log("original image download requested msgId=" + recordId
                 + " resource=" + (resourceType == 1 ? "hd" : "large")
                 + " result=" + code);
+    }
+
+    // WeChat only writes the voice audio blob to local storage lazily -- unlike images and
+    // video, it does not appear to be auto-downloaded on receipt. Without this, resolveMediaFile
+    // can find a real database row (voiceinfo/voiceinfo2) with a filename hint pointing at a
+    // file that simply does not exist on disk yet, and no amount of client-side retrying can
+    // conjure it. This mirrors the image original-download trigger, but for the WeChat internal
+    // "VoiceMsgFeatureService.asyncDownloadVoice" API (canonical dg0.f / real yi0.f -> ej0.o.jj).
+    private static void requestVoiceDownloadAsync(
+            final long recordId, final Long msgSvrId, final String talker, final String fileNameHint) {
+        if (recordId <= 0L || isBlank(talker) || isBlank(fileNameHint)
+                || !markVoiceDownloadDispatched(recordId)) {
+            return;
+        }
+        Runnable request = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    requestVoiceDownload(recordId, msgSvrId, talker, fileNameHint);
+                } catch (Throwable t) {
+                    forgetVoiceDownloadDispatch(recordId);
+                    log("voice download request failed msgId=" + recordId
+                            + " error=" + shortError(rootCause(t)));
+                }
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            request.run();
+            return;
+        }
+        if (!new Handler(Looper.getMainLooper()).post(request)) {
+            forgetVoiceDownloadDispatch(recordId);
+        }
+    }
+
+    private static void requestVoiceDownload(long recordId, Long msgSvrId, String talker, String fileNameHint)
+            throws Exception {
+        ClassLoader classLoader = runtimeClassLoader(WECHAT_CLASS_LOADER);
+        if (classLoader == null) {
+            throw new IllegalStateException("WeChat class loader is unavailable");
+        }
+        Class<?> serviceInterface = findVersionedClass(classLoader, "dg0.f");
+        Object service = findMethod(findVersionedClass(classLoader, "i95.n0"), "c", Class.class)
+                .invoke(null, serviceInterface);
+        if (service == null) {
+            throw new IllegalStateException("VoiceMsgFeatureService is not available");
+        }
+        Class<?> paramsClass = findVersionedClass(classLoader, "xi0.a");
+        Constructor<?> paramsCtor = findConstructor(
+                paramsClass, String.class, String.class, long.class, long.class, long.class);
+        Object params = paramsCtor.newInstance(
+                fileNameHint,
+                talker,
+                recordId,
+                msgSvrId == null ? 0L : msgSvrId.longValue(),
+                0L);
+        Method download = findMethod(service.getClass(), "jj", paramsClass);
+        download.invoke(service, params);
+        log("voice download requested msgId=" + recordId + " fileName=" + fileNameHint);
+    }
+
+    private static boolean markVoiceDownloadDispatched(long recordId) {
+        synchronized (VOICE_DOWNLOAD_DISPATCHED_IDS) {
+            if (VOICE_DOWNLOAD_DISPATCHED_IDS.size() > 1024) {
+                VOICE_DOWNLOAD_DISPATCHED_IDS.clear();
+            }
+            return VOICE_DOWNLOAD_DISPATCHED_IDS.add(recordId);
+        }
+    }
+
+    private static void forgetVoiceDownloadDispatch(long recordId) {
+        synchronized (VOICE_DOWNLOAD_DISPATCHED_IDS) {
+            VOICE_DOWNLOAD_DISPATCHED_IDS.remove(recordId);
+        }
+    }
+
+    // Same rationale as requestVoiceDownloadAsync, but for chat video: WeChat's
+    // VideoDownloadFeatureService (canonical ri0.y1 / real si0.t) exposes an
+    // asyncDownloadVideo-style "jj(e9 msgInfo)" that takes the message record directly,
+    // no separate params object needed.
+    private static void requestVideoDownloadAsync(final long recordId, final String talker) {
+        if (recordId <= 0L || isBlank(talker) || !markVideoDownloadDispatched(recordId)) {
+            return;
+        }
+        Runnable request = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    requestVideoDownload(recordId, talker);
+                } catch (Throwable t) {
+                    forgetVideoDownloadDispatch(recordId);
+                    log("video download request failed msgId=" + recordId
+                            + " error=" + shortError(rootCause(t)));
+                }
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            request.run();
+            return;
+        }
+        if (!new Handler(Looper.getMainLooper()).post(request)) {
+            forgetVideoDownloadDispatch(recordId);
+        }
+    }
+
+    private static void requestVideoDownload(long recordId, String talker) throws Exception {
+        ClassLoader classLoader = runtimeClassLoader(WECHAT_CLASS_LOADER);
+        if (classLoader == null) {
+            throw new IllegalStateException("WeChat class loader is unavailable");
+        }
+        WeChatVersionSymbols.Profile symbols = weChatSymbols(classLoader);
+        Class<?> messageStorageClass = findVersionedClass(classLoader, "qt0.k0");
+        Class<?> messageClass = findVersionedClass(classLoader, "com.tencent.mm.storage.f9");
+        Object message = findMethod(messageStorageClass, symbols.methods.imageMessageLookup, String.class, long.class)
+                .invoke(null, talker, recordId);
+        if (message == null) {
+            throw new IllegalStateException("video message record was not found");
+        }
+        Class<?> serviceInterface = findVersionedClass(classLoader, "ri0.y1");
+        Object service = findMethod(findVersionedClass(classLoader, "i95.n0"), "c", Class.class)
+                .invoke(null, serviceInterface);
+        if (service == null) {
+            throw new IllegalStateException("VideoDownloadFeatureService is not available");
+        }
+        Method download = findMethod(service.getClass(), "jj", messageClass);
+        Object result = download.invoke(service, message);
+        log("video download requested msgId=" + recordId + " result=" + result);
+    }
+
+    private static boolean markVideoDownloadDispatched(long recordId) {
+        synchronized (VIDEO_DOWNLOAD_DISPATCHED_IDS) {
+            if (VIDEO_DOWNLOAD_DISPATCHED_IDS.size() > 1024) {
+                VIDEO_DOWNLOAD_DISPATCHED_IDS.clear();
+            }
+            return VIDEO_DOWNLOAD_DISPATCHED_IDS.add(recordId);
+        }
+    }
+
+    private static void forgetVideoDownloadDispatch(long recordId) {
+        synchronized (VIDEO_DOWNLOAD_DISPATCHED_IDS) {
+            VIDEO_DOWNLOAD_DISPATCHED_IDS.remove(recordId);
+        }
     }
 
     private static ImageInfoRecord imageInfoFromWechatStorage(
@@ -3329,15 +3519,108 @@ public final class HookEntry implements IXposedHookLoadPackage {
             logEmojiInfoDiagnostic(emojiMd5);
         }
         if (type == 34) {
-            // Never attach a globally recent voice file to a message. If the exact
-            // database-backed hint cannot be resolved, reporting no media is safer
-            // than leaking audio across chats or users.
+            // voice2/ is sharded two levels deep by MD5(hint)[0:2]/[2:4] (confirmed against
+            // real downloaded files, e.g. hint "amr_<hash>" -> voice2/96/99/msg_amr_<hash>.amr)
+            // and holds tens of thousands of files across 256 top-level shards. The generic
+            // findMediaInProfileRoots search below is breadth-limited (visited cap 6000) so it
+            // routinely gives up long before reaching the correct shard for a hash-based
+            // filename -- that cap exists to bound a small, un-sharded directory, not this one.
+            // Since the exact hint is already known, compute the shard path directly instead.
+            File sharded = voiceShardedFile(microMsgRoot, mediaHint);
+            if (sharded != null) {
+                return sharded;
+            }
+            // Never fall back to a fuzzy/global scan for voice: if the sharded lookup and the
+            // exact-name profile search both miss, reporting no media is safer than leaking
+            // audio across chats or users.
+            logVoiceMediaMissDiagnostic(microMsgRoot, names);
             return null;
         }
         if (type == 43 || type == 62) {
             return findMediaInProfileRoots(new File(appRoot, "cache"), videoCacheSearchRoots(), names);
         }
         return null;
+    }
+
+    private static File voiceShardedFile(File microMsgRoot, String hint) {
+        if (isBlank(hint) || microMsgRoot == null) {
+            return null;
+        }
+        String base = stripKnownMediaExtension(hint.trim());
+        if (base.startsWith("msg_")) {
+            base = base.substring(4);
+        }
+        String shardHex;
+        try {
+            MessageDigest digest = MessageDigest.getInstance("MD5");
+            byte[] hash = digest.digest(base.getBytes("UTF-8"));
+            StringBuilder hex = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                hex.append(String.format(Locale.US, "%02x", b));
+            }
+            shardHex = hex.toString();
+        } catch (Exception e) {
+            return null;
+        }
+        if (shardHex.length() < 4) {
+            return null;
+        }
+        File[] profiles = microMsgRoot.listFiles();
+        if (profiles == null) {
+            return null;
+        }
+        String fileNameBase = "msg_" + base;
+        for (File profile : profiles) {
+            if (profile == null || !profile.isDirectory()) {
+                continue;
+            }
+            File shardDir = new File(new File(new File(profile, "voice2"), shardHex.substring(0, 2)), shardHex.substring(2, 4));
+            if (!shardDir.isDirectory()) {
+                continue;
+            }
+            File amr = new File(shardDir, fileNameBase + ".amr");
+            if (amr.isFile()) {
+                return amr;
+            }
+            File silk = new File(shardDir, fileNameBase + ".silk");
+            if (silk.isFile()) {
+                return silk;
+            }
+        }
+        return null;
+    }
+
+    private static void logVoiceMediaMissDiagnostic(File microMsgRoot, List<String> names) {
+        try {
+            File[] profiles = microMsgRoot.listFiles();
+            if (profiles == null) {
+                log("voice media miss: cannot list " + microMsgRoot.getAbsolutePath() + " (listFiles null) names=" + names);
+                return;
+            }
+            StringBuilder sb = new StringBuilder("voice media miss names=").append(names).append(" profiles=[");
+            for (File profile : profiles) {
+                if (!profile.isDirectory()) {
+                    continue;
+                }
+                File voice2 = new File(profile, "voice2");
+                sb.append(profile.getName()).append("(voice2Exists=").append(voice2.isDirectory());
+                if (voice2.isDirectory()) {
+                    File[] shards = voice2.listFiles();
+                    sb.append(",shardCount=").append(shards == null ? -1 : shards.length);
+                    if (shards != null && shards.length > 0) {
+                        File firstShard = shards[0];
+                        sb.append(",firstShard=").append(firstShard.getName());
+                        File[] inner = firstShard.listFiles();
+                        sb.append(",firstShardChildren=").append(inner == null ? -1 : inner.length);
+                    }
+                }
+                sb.append(") ");
+            }
+            sb.append("]");
+            log(sb.toString());
+        } catch (Throwable t) {
+            log("voice media miss diagnostic crashed: " + shortError(rootCause(t)));
+        }
     }
 
     private static File findMediaInProfileRoots(File profileRoot, String[] roots, List<String> names) {
@@ -3424,6 +3707,16 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 }
                 addMediaCandidate(names, base + ".amr");
                 addMediaCandidate(names, base + ".silk");
+                // The voiceinfo/voiceinfo2 FileName hint (e.g. "amr_<hash>") is not the actual
+                // on-disk name once WeChat downloads the audio: it lands under voice2/<shard>/
+                // as "msg_" + that hint + extension (confirmed against a real downloaded file:
+                // voice2/96/99/msg_amr_<hash>.amr). Without this, a freshly-downloaded voice
+                // file could never be found even though requestVoiceDownloadAsync succeeded.
+                if (!base.startsWith("msg_")) {
+                    addMediaCandidate(names, "msg_" + base);
+                    addMediaCandidate(names, "msg_" + base + ".amr");
+                    addMediaCandidate(names, "msg_" + base + ".silk");
+                }
             }
         }
         return names;
@@ -5056,7 +5349,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
      */
     private static void probeTransferClassChain(ClassLoader classLoader) {
         String[] chain = {
-                "com.tencent.mm.modelbase.m1",
+                weChatSymbols(classLoader).className("com.tencent.mm.modelbase.m1"),
                 "com.tencent.mm.wallet_core.model.d1",
                 "com.tencent.mm.wallet_core.model.z0",
                 "com.tencent.mm.wallet_core.tenpay.model.o",
@@ -5201,7 +5494,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
      * instance directly and call the real .h(scene, 0) on it, instead of z2.b().
      */
     private static void enqueueNetScene(ClassLoader classLoader, Object scene) throws Exception {
-        Class<?> runCgi = findClass(classLoader, "com.tencent.mm.modelbase.z2");
+        Class<?> runCgi = findVersionedClass(classLoader, "com.tencent.mm.modelbase.z2");
         Object queueHandle = findField(runCgi, "b").get(null);
         if (queueHandle == null) {
             throw new IllegalStateException("NetSceneQueue is not ready");
@@ -5217,7 +5510,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         Method enqueue = findMethod(
                 netSceneQueue.getClass(),
                 "h",
-                findClass(classLoader, "com.tencent.mm.modelbase.m1"),
+                findVersionedClass(classLoader, "com.tencent.mm.modelbase.m1"),
                 int.class);
         Object accepted = enqueue.invoke(netSceneQueue, scene, 0);
         if (accepted instanceof Boolean && !((Boolean) accepted)) {
@@ -5832,17 +6125,43 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static String prepareWeChatVoiceFile(ClassLoader classLoader, String voiceFileName, File source) throws Exception {
-        String audioPath = voiceStoragePath(classLoader, voiceFileName, true);
-        copyFileToWeChatPath(classLoader, source, audioPath);
+        // audioScoped=true used to be the only path this required (the audioScoped=false
+        // "legacy" lookup was always best-effort, wrapped in its own try/catch below). On
+        // 8.0.79 the audioScoped=true call still resolves to the right class/method but
+        // comes back empty from some rewritten internal logic we can't single-step through
+        // (its body doesn't decompile and none of the stable utility methods it used to call
+        // on 8.0.78 get hit anymore). Rather than hard-fail here, try both variants and use
+        // whichever actually returns a path -- audioScoped=true preferred when it works, but
+        // audioScoped=false is no less valid a storage location if it's the only one that
+        // resolves.
+        String audioPath = "";
+        Throwable audioError = null;
         try {
-            String legacyPath = voiceStoragePath(classLoader, voiceFileName, false);
-            if (!isBlank(legacyPath) && !legacyPath.equals(audioPath)) {
-                copyFileToWeChatPath(classLoader, source, legacyPath);
-            }
+            audioPath = voiceStoragePath(classLoader, voiceFileName, true);
         } catch (Throwable t) {
-            log("prepare legacy voice path skipped: " + shortError(t));
+            audioError = t;
         }
-        return audioPath;
+        String legacyPath = "";
+        try {
+            legacyPath = voiceStoragePath(classLoader, voiceFileName, false);
+        } catch (Throwable t) {
+            log("prepare legacy voice path failed: " + shortError(t));
+        }
+        if (isBlank(audioPath) && isBlank(legacyPath)) {
+            throw audioError != null
+                    ? new IOException("voice storage path is empty", audioError)
+                    : new IOException("voice storage path is empty");
+        }
+        String primaryPath = !isBlank(audioPath) ? audioPath : legacyPath;
+        copyFileToWeChatPath(classLoader, source, primaryPath);
+        if (!isBlank(legacyPath) && !legacyPath.equals(primaryPath)) {
+            try {
+                copyFileToWeChatPath(classLoader, source, legacyPath);
+            } catch (Throwable t) {
+                log("copy to legacy voice path failed: " + shortError(t));
+            }
+        }
+        return primaryPath;
     }
 
     private static String voiceStoragePath(ClassLoader classLoader, String voiceFileName, boolean audioScoped) throws Exception {
@@ -5868,6 +6187,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
         Object path = fullPath.invoke(storage, voiceResource, voiceFileName, true);
         String value = path == null ? "" : String.valueOf(path);
         if (isBlank(value)) {
+            log("voiceStoragePath diagnostic: storageClass=" + storage.getClass().getName()
+                    + " pathMethod=" + pathMethod
+                    + " voiceFileName=" + voiceFileName
+                    + " audioScoped=" + audioScoped
+                    + " voiceResourceClass=" + (voiceResource == null ? "null" : voiceResource.getClass().getName())
+                    + " voiceResource=" + voiceResource);
             throw new IOException("voice storage path is empty");
         }
         return value;
@@ -8074,19 +8399,29 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     log("sendText builder returned false but outgoing text was verified msgId=" + msgId);
                     return SendResult.sent(msgId);
                 }
-                return SendResult.failed("WeChat send builder returned false");
+                builderUnavailable = new IllegalStateException("WeChat send builder returned false");
+                log("w11.r1 builder path returned false, trying w11.r0 NetScene");
+            } else {
+                log("sendText sent via w11.r1 builder wxid=" + wxid + " msgType=" + msgType);
+                long msgId = waitForOutgoingTextMessage(config, wxid, beforeMsgId, text, 8000L);
+                if (msgId > 0L) {
+                    return SendResult.sent(msgId);
+                }
+                return SendResult.sent(0L);
             }
-            log("sendText sent via w11.r1 builder wxid=" + wxid + " msgType=" + msgType);
-            long msgId = waitForOutgoingTextMessage(config, wxid, beforeMsgId, text, 8000L);
-            if (msgId > 0L) {
-                return SendResult.sent(msgId);
-            }
-            return SendResult.sent(0L);
-        } catch (ClassNotFoundException | NoSuchMethodException e) {
-            builderUnavailable = e;
-            log("w11.r1 builder path unavailable, trying dk5.s5.fj: " + shortError(e));
         } catch (Throwable t) {
-            return SendResult.failed("WeChat send failed via w11.r1 builder: " + shortError(t));
+            // Any failure here -- including an unexpected exception shape from a
+            // per-version symbol that resolved to the wrong (but still loadable)
+            // class, not just ClassNotFoundException/NoSuchMethodException -- should
+            // fall through to the other independent send paths below rather than
+            // give up immediately. This one previously short-circuited on anything
+            // other than those two exception types, which meant a single wrong
+            // guess for this path's symbols (w11.s1/aq1.l) could fail text sending
+            // outright even though the w11.r0 NetScene path right below it, using a
+            // completely different and already-confirmed-correct symbol, would have
+            // worked.
+            builderUnavailable = t;
+            log("w11.r1 builder path failed, trying w11.r0 NetScene: " + shortError(t));
         }
 
         try {
@@ -8171,13 +8506,13 @@ public final class HookEntry implements IXposedHookLoadPackage {
             throw new IllegalStateException("w11.r0 inserted local msg failed");
         }
 
-        Class<?> runCgi = findClass(classLoader, "com.tencent.mm.modelbase.z2");
+        Class<?> runCgi = findVersionedClass(classLoader, "com.tencent.mm.modelbase.z2");
         Object ready = findNoArgMethod(runCgi, "c").invoke(null);
         if (ready instanceof Boolean && !((Boolean) ready)) {
             throw new IllegalStateException("NetSceneQueue is not ready");
         }
 
-        Method enqueue = findMethod(runCgi, "b", findClass(classLoader, "com.tencent.mm.modelbase.m1"));
+        Method enqueue = findMethod(runCgi, "b", findVersionedClass(classLoader, "com.tencent.mm.modelbase.m1"));
         enqueue.invoke(null, scene);
         return msgId;
     }

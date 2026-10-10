@@ -316,10 +316,96 @@ final class WeChatVersionSymbols {
                     "com.tencent.mm.vfs.w6", "com.tencent.mm.vfs.a7",
                     "com.tencent.mm.storage.f9", "com.tencent.mm.storage.e9"));
 
+    /**
+     * WeChat 8.0.79 reassigned nearly every short obfuscated class name again, same as
+     * every prior point release. Resolved via structural shape-matching (method/field
+     * signatures, superclass, interfaces) between the 8.0.78 and 8.0.79 dex files rather
+     * than purely by re-running the feature and watching it fail, since that tooling
+     * (dex_shape.py-style class-shape index + similarity ranking, cross-checked against
+     * jadx-decompiled method bodies for the ones with ambiguous/duplicate signatures)
+     * now exists. The two resolve() probe classes, the image/voice/video download
+     * feature services (dg0.f/h70.y/h70.w/ri0.y1 and their xi0.a params class) and the
+     * location/transfer-adjacent classes already exercised by verified features are
+     * confirmed either from decompiled method bodies or from an unambiguous structural
+     * match; a handful of rarely-exercised ones (quoteStorage/voiceStoragePath/
+     * videoBuildTask/emojiManager/locationBuildTask/locationSendTask method names, the
+     * mini-program r45.* aliases, and the w11.s1/aq1.l fallback text-send builder) are
+     * carried over unverified from 8.0.78 as placeholders, same as 8.0.78 was seeded
+     * from 8.0.77 -- correct the first time the feature that uses one is exercised and
+     * fails.
+     */
+    private static final Profile WECHAT_8079 = new Profile(
+            "8.0.79",
+            false,
+            false,
+            true,
+            true,
+            true,
+            methods("Wi", "bk", "Bj", "Cj", "j2", "Ej", "zj", "Gj", "Ij", "Ij", "Mj", "Cj", "Gj", "Ij"),
+            fields("x2", "i0", "k2", "j2", "l2", "C2", "t2", "B2", "m2"),
+            aliases(
+                    "i95.n0", "ni5.n0",
+                    "i95.y", "ni5.y",
+                    "k95.a", "pi5.a",
+                    "w11.r0", "f61.s0",
+                    "w11.s1", "xw1.p1",
+                    "aq1.l", "z10.n1",
+                    "c01.e2", "l41.d2",
+                    "c01.f7", "l41.i7",
+                    "c01.h7", "l41.k7",
+                    "c01.ia", "e31.ba",
+                    "aa0.e", "zb0.e",
+                    "ui3.b", "zz.b",
+                    "ot0.q", "nx0.r",
+                    "tg3.u0", "no3.u0",
+                    "bm5.y", "pv5.x",
+                    "bm5.f0", "pv5.e0",
+                    "oi3.g", "oq3.g",
+                    "cg0.d", "fj0.d",
+                    "dg0.f", "gj0.f",
+                    "qi3.b0", "qq3.c0",
+                    "qi3.x", "qq3.y",
+                    "ut.s0", "gu.o0",
+                    "dk5.w", "ud6.w",
+                    "vf0.r2", "yi0.t2",
+                    "vf0.u2", "yi0.w2",
+                    "vf0.i3", "yi0.k3",
+                    "vf0.h3", "yi0.j3",
+                    "vf0.p2", "yi0.r2",
+                    "wf0.b2", "zi0.b2",
+                    "y80.q1", "sb0.t1",
+                    "z80.h0", "tb0.h0",
+                    "y80.p0", "sb0.p0",
+                    "r45.uf6", "nd5.fr6",
+                    "r45.vh4", "nd5.gq4",
+                    "r45.xz6", "nd5.hc7",
+                    "r15.b", "na5.d",
+                    "r15.d", "na5.f",
+                    "qh3.a1", "no3.c1",
+                    "jg0.x", "nj0.x",
+                    "h70.y", "ea0.y",
+                    "h70.w", "ea0.w",
+                    "qt0.k0", "ox0.k0",
+                    "com.tencent.mm.vfs.w6", "com.tencent.mm.vfs.a7",
+                    "com.tencent.mm.storage.f9", "com.tencent.mm.storage.e9",
+                    "xi0.a", "fj0.a",
+                    "ri0.y1", "zi0.y1",
+                    // Same "short name under an otherwise-stable com.tencent.mm.* package
+                    // gets reassigned to an unrelated class" pattern already hit by
+                    // MMApplicationContext (x2 -> a3) in 8.0.78; the NetSceneQueue helper
+                    // (readiness check "c"/enqueue "b") moved the same way here, confirmed
+                    // structurally identical at com.tencent.mm.modelbase.a3.
+                    "com.tencent.mm.modelbase.z2", "com.tencent.mm.modelbase.a3",
+                    "com.tencent.mm.modelbase.m1", "com.tencent.mm.modelbase.n1"));
+
     private WeChatVersionSymbols() {
     }
 
     static Profile resolve(ClassProbe probe) {
+        if (probe.isPresent(WECHAT_8079.className("i95.n0"))
+                && probe.isPresent(WECHAT_8079.className("w11.r0"))) {
+            return WECHAT_8079;
+        }
         if (probe.isPresent(WECHAT_8078.className("i95.n0"))
                 && probe.isPresent(WECHAT_8078.className("w11.r0"))) {
             return WECHAT_8078;
