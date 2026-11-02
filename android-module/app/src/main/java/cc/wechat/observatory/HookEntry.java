@@ -381,6 +381,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    // Diagnostic only: confirms (a) the reflective onAppForeground call in
+    // wakeNetSceneQueueForeground actually reaches the real method body rather than silently
+    // no-op'ing on a wrong class/overload, and (b) what the "d"/"h" enqueue-path methods
+    // actually do to the queue's internal state on a real send -- WeChat's own logging for
+    // this class goes through com.tencent.mars.xlog.Log, which writes to its own log files,
+    // not logcat, so there is otherwise no visibility into this from outside the process.
     private static Context contextFromWrapper(Object value) {
         if (value instanceof Context) {
             return (Context) value;
@@ -5493,7 +5499,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
      * -> field b (the com.tencent.mm.modelbase.r1 NetSceneQueue). Reach that same r1
      * instance directly and call the real .h(scene, 0) on it, instead of z2.b().
      */
-    private static void enqueueNetScene(ClassLoader classLoader, Object scene) throws Exception {
+    private static Object resolveNetSceneQueueInstance(ClassLoader classLoader) throws Exception {
         Class<?> runCgi = findVersionedClass(classLoader, "com.tencent.mm.modelbase.z2");
         Object queueHandle = findField(runCgi, "b").get(null);
         if (queueHandle == null) {
@@ -5507,6 +5513,36 @@ public final class HookEntry implements IXposedHookLoadPackage {
         if (netSceneQueue == null) {
             throw new IllegalStateException("NetSceneQueue is not ready");
         }
+        return netSceneQueue;
+    }
+
+    // NetSceneQueue (com.tencent.mm.modelbase.r1 in 8.0.78, s1 in 8.0.79 -- unaliased since
+    // this call site resolves the instance structurally via resolveNetSceneQueueInstance
+    // rather than by canonical class name) tracks its own app-foreground/background state
+    // via the stable, un-obfuscated com.tencent.mm.app.s2 callback interface
+    // (onAppForeground/onAppBackground are kept literal across versions, confirmed in both
+    // 8.0.78's r1.java and 8.0.79's s1.java) and throttles/defers real network dispatch of
+    // queued NetScenes while backgrounded -- independently of, and in addition to, Android's
+    // own OS-level background execution limits. This is why a send can locally succeed (the
+    // scene is accepted into the queue, our own verification sees the local DB row and a
+    // non-negative msgId) yet never actually reach the recipient until WeChat's own UI is
+    // reopened and this flips back to foreground, flushing the backlog. Proactively nudging
+    // the queue into believing it is foreground immediately before enqueueing sidesteps that
+    // throttle without needing the real Activity visible. Best-effort only: never allowed to
+    // block or fail the actual send if the nudge itself doesn't work on some version.
+    private static void wakeNetSceneQueueForeground(ClassLoader classLoader) {
+        try {
+            Object netSceneQueue = resolveNetSceneQueueInstance(classLoader);
+            Method onAppForeground = findMethod(netSceneQueue.getClass(), "onAppForeground", String.class);
+            onAppForeground.invoke(netSceneQueue, "cc.wechat.observatory");
+        } catch (Throwable t) {
+            log("wakeNetSceneQueueForeground failed: " + shortError(rootCause(t)));
+        }
+    }
+
+    private static void enqueueNetScene(ClassLoader classLoader, Object scene) throws Exception {
+        Object netSceneQueue = resolveNetSceneQueueInstance(classLoader);
+        wakeNetSceneQueueForeground(classLoader);
         Method enqueue = findMethod(
                 netSceneQueue.getClass(),
                 "h",
@@ -8394,7 +8430,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
         try {
             boolean sent = sendViaSendBuilder(classLoader, wxid, text, msgType);
             if (!sent) {
-                long msgId = waitForOutgoingTextMessage(config, wxid, beforeMsgId, text, 3000L);
+                // Was 3000ms, too short: under load the builder's send can still land
+                // locally a few seconds later even after it returned false, and giving
+                // up early here made us fall through to NetScene and send the same text
+                // again for real -- producing real duplicate WeChat messages even though
+                // the server-side outbox only ever leased/attempted the item once.
+                // Match the "builder returned true" branch's 8000ms budget so a merely
+                // slow builder send has the same chance to be recognized before we try
+                // an independent fallback path.
+                long msgId = waitForOutgoingTextMessage(config, wxid, beforeMsgId, text, 8000L);
                 if (msgId > 0L) {
                     log("sendText builder returned false but outgoing text was verified msgId=" + msgId);
                     return SendResult.sent(msgId);
@@ -8512,8 +8556,21 @@ public final class HookEntry implements IXposedHookLoadPackage {
             throw new IllegalStateException("NetSceneQueue is not ready");
         }
 
-        Method enqueue = findMethod(runCgi, "b", findVersionedClass(classLoader, "com.tencent.mm.modelbase.m1"));
-        enqueue.invoke(null, scene);
+        // z2.b(scene) (the "RunCgi.enqueue"-looking static helper) actually forwards to
+        // NetSceneQueue.d(scene), which per the doc comment on resolveNetSceneQueueInstance
+        // is CANCEL, not enqueue -- it never reached the network at all, it just
+        // self-cancelled and relied on some independent, foreground-triggered "resend
+        // unsent local rows" scan to eventually flush it once WeChat's UI was reopened.
+        // enqueueNetScene (used for transfers) already uses the real entry point,
+        // NetSceneQueue.h(scene, int); route text through the same one instead of z2.b().
+        wakeNetSceneQueueForeground(classLoader);
+        Object netSceneQueue = resolveNetSceneQueueInstance(classLoader);
+        Method enqueue = findMethod(
+                netSceneQueue.getClass(), "h", findVersionedClass(classLoader, "com.tencent.mm.modelbase.m1"), int.class);
+        Object accepted = enqueue.invoke(netSceneQueue, scene, 0);
+        if (accepted instanceof Boolean && !((Boolean) accepted)) {
+            throw new IllegalStateException("NetSceneQueue rejected text send request");
+        }
         return msgId;
     }
 

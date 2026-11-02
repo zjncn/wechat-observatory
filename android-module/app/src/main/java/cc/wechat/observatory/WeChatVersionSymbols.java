@@ -396,12 +396,149 @@ final class WeChatVersionSymbols {
                     // (readiness check "c"/enqueue "b") moved the same way here, confirmed
                     // structurally identical at com.tencent.mm.modelbase.a3.
                     "com.tencent.mm.modelbase.z2", "com.tencent.mm.modelbase.a3",
-                    "com.tencent.mm.modelbase.m1", "com.tencent.mm.modelbase.n1"));
+                    "com.tencent.mm.modelbase.m1", "com.tencent.mm.modelbase.n1",
+                    // NetSceneQueue itself (implements com.tencent.mm.app.s2, the stable
+                    // un-obfuscated onAppForeground/onAppBackground interface). Canonical
+                    // baseline name is 8.0.78's real name (r1); 8.0.79 reassigned it to s1.
+                    // Confirmed via decompiled source: both have identical structure (same
+                    // "MicroMsg.NetSceneQueue" log tag, same onAppBackground/onAppForeground
+                    // overrides) -- not a guess.
+                    "com.tencent.mm.modelbase.r1", "com.tencent.mm.modelbase.s1"));
+
+    /**
+     * WeChat 8.0.80. Resolved via the same structural dex-shape matching used for 8.0.79
+     * (full-class shape index of both versions, cross-checked with partial jadx decompile
+     * for the handful of identical-signature "twin method" traps already known from 8.0.79
+     * -- see the voiceStoragePath/voiceSendTask comments below). Confidence is noted inline:
+     * SOLID/CONFIRMED entries were cross-verified two independent ways (e.g. an exact
+     * constructor-signature match plus an independent structural top-candidate, or a
+     * decompiled source read); entries marked weak/seeded are a single best-effort
+     * structural guess carried through unverified, same as every prior version's first pass
+     * -- expect to correct them the first time the feature that uses one is exercised and
+     * fails, exactly like 8.0.76 through 8.0.79 were each refined in turn.
+     */
+    private static final Profile WECHAT_8080 = new Profile(
+            "8.0.80",
+            false,
+            false,
+            true,
+            true,
+            true,
+            // voiceStoragePath="hk" and voiceSendTask="Sj" are CONFIRMED via decompiled
+            // source read (not guessed): mc0.b has the same identical-signature twin-method
+            // trap as 8.0.79's Ej/bk pair (here Kj/hk), and Kj is again the undecompilable
+            // one ("Method dump skipped") while hk has the real "[f9]getVoiceFullPath" body.
+            // wj0.o's voiceSendTask candidates (Nj/Oj/Sj, all void(task)) were disambiguated
+            // by reading their bodies: Nj is "cancelTask", Oj is "initSync", Sj is the real
+            // send entry point (delegates into the async Rj path). videoBuildTask="Oj" (on
+            // the OTHER class, fj0.e3) is CONFIRMED via exact signature match: Oj(fj0.n3)
+            // returns hr3.f0, exactly matching (h3Class)->qi3.b0. The rest of this row is
+            // carried over from 8.0.79 unverified, same as every prior first pass.
+            methods("Wi", "hk", "Bj", "Cj", "j2", "Ej", "zj", "Gj", "Ij", "Oj", "Sj", "Cj", "Gj", "Ij"),
+            fields("x2", "i0", "k2", "j2", "l2", "C2", "t2", "B2", "m2"),
+            aliases(
+                    "i95.n0", "fi5.n0",
+                    // Package-sibling inferred from i95.n0 (both under the same ni5->fi5
+                    // whole-package rename); not independently verified.
+                    "i95.y", "fi5.y",
+                    // CONFIRMED via implementer trick: com.tencent.mm.app.l0 (unchanged real
+                    // name) now implements hi5.a instead of pi5.a.
+                    "k95.a", "hi5.a",
+                    "w11.r0", "q61.s0",
+                    "w11.s1", "xw1.p1",
+                    "aq1.l", "g20.n1",
+                    "c01.e2", "w41.e2",
+                    // CONFIRMED independently twice: direct structural match AND as a
+                    // positional hit inside the video constructor signature cross-check
+                    // below (Lw41/j7; is the first param, matching old Ll41/i7;).
+                    "c01.f7", "w41.j7",
+                    "c01.h7", "w41.l7",
+                    "c01.ia", "p31.fa",
+                    // CONFIRMED via implementer trick: zm3.k0 (old) -> qn3.k0 (new),
+                    // interfaces=['hc0.e'].
+                    "aa0.e", "hc0.e",
+                    "ui3.b", "zz.b",
+                    "ot0.q", "xx0.r",
+                    // CONFIRMED via implementer trick: ec0.b (old) -> mc0.b (new, same class
+                    // that holds the voiceStoragePath twin-method trap above),
+                    // interfaces=['ep3.u0'].
+                    "tg3.u0", "ep3.u0",
+                    "bm5.y", "jv5.x",
+                    "bm5.f0", "jv5.e0",
+                    "oi3.g", "oq3.g",
+                    "cg0.d", "pj0.d",
+                    // CONFIRMED via implementer trick: mj0.o (old) -> wj0.o (new, same class
+                    // disambiguated for voiceSendTask above), interfaces=['qj0.f'].
+                    "dg0.f", "qj0.f",
+                    // Both CONFIRMED via method-signature read on the resolved dispatcher
+                    // class itself: hr3.b0.d(Lhr3/f0;) matches the known
+                    // "d(task)->Flow" dispatch shape, with hr3.f0 as the task-interface
+                    // parameter type.
+                    "qi3.b0", "hr3.f0",
+                    "qi3.x", "hr3.b0",
+                    "ut.s0", "lu.o0",
+                    "dk5.w", "ud6.w",
+                    // The entire vf0.* video-constructor-params family below is CONFIRMED
+                    // via the exact constructor signature of vf0.r2's resolved class
+                    // (fj0.x2), read directly from the shape index:
+                    // (Lw41/j7; Lgd5/jo6; Ljava/lang/String; Lgd5/h97; Ljava/lang/String;
+                    //  Lgd5/iq4; Z Lfj0/v2; Ljava/lang/String; Lga5/f; Z Z Z
+                    //  Ljava/lang/String; ...)V
+                    // cross-checked against vf0.h3's resolved class (fj0.n3) constructor
+                    // (Ljava/lang/String; Lfj0/a3; Z Lfj0/o3;)V matching (String, u2, Z, i3)
+                    // -- this is the same technique that nailed down r45.uf6/xz6 for 8.0.79.
+                    "vf0.r2", "fj0.x2",
+                    "vf0.u2", "fj0.a3",
+                    "vf0.i3", "fj0.o3",
+                    "vf0.h3", "fj0.n3",
+                    "vf0.p2", "fj0.v2",
+                    // CONFIRMED via implementer trick: yi0.a3 (old) -> fj0.e3 (new, the same
+                    // class videoBuildTask="Oj" was read from above), interfaces=['gj0.a2'].
+                    "wf0.b2", "gj0.a2",
+                    "y80.q1", "ac0.u1",
+                    // CONFIRMED via implementer trick: sb0.p0 (old) -> ac0.q0 (new, same
+                    // sibling-package pattern as y80.q1 below it: t1->u1, p0->q0),
+                    // interfaces=['bc0.h0'].
+                    "z80.h0", "bc0.h0",
+                    "y80.p0", "ac0.q0",
+                    // CONFIRMED via the vf0.r2 constructor cross-check above (positions 2/4/6).
+                    "r45.uf6", "gd5.jo6",
+                    "r45.vh4", "gd5.iq4",
+                    "r45.xz6", "gd5.h97",
+                    "r15.b", "ga5.d",
+                    // CONFIRMED via the vf0.r2 constructor cross-check above (position 10).
+                    "r15.d", "ga5.f",
+                    // CONFIRMED via implementer trick: rt5.i5 (old) -> lt5.d5 (new),
+                    // interfaces=['ep3.c1'].
+                    "qh3.a1", "ep3.c1",
+                    "jg0.x", "xj0.x",
+                    // Both CONFIRMED via positional interface-list comparison: old da0.e
+                    // implements ['ea0.g0','ea0.v','ea0.y','ea0.z'] (whole ea0 package);
+                    // new la0.e implements ['ma0.g0','ma0.v','ma0.y','ma0.z'] in the exact
+                    // same order -- ea0.y (h70.y) -> ma0.y, and ea0.w (h70.w, a sibling of
+                    // the same whole-package rename) -> ma0.w (confirmed to exist in the new
+                    // index with a matching empty-interface shape).
+                    "h70.y", "ma0.y",
+                    "h70.w", "ma0.w",
+                    "qt0.k0", "yx0.k0",
+                    "com.tencent.mm.vfs.w6", "com.tencent.mm.vfs.a7",
+                    "com.tencent.mm.storage.f9", "com.tencent.mm.storage.e9",
+                    // CONFIRMED via decompiled source read: wj0.o.Mj(pj0.a params) is the
+                    // asyncDownloadVoice entry point, taking this exact params class.
+                    "xi0.a", "pj0.a",
+                    "ri0.y1", "zi0.y1",
+                    "com.tencent.mm.modelbase.z2", "com.tencent.mm.modelbase.a3",
+                    "com.tencent.mm.modelbase.m1", "com.tencent.mm.modelbase.n1",
+                    "com.tencent.mm.modelbase.r1", "com.tencent.mm.modelbase.s1"));
 
     private WeChatVersionSymbols() {
     }
 
     static Profile resolve(ClassProbe probe) {
+        if (probe.isPresent(WECHAT_8080.className("i95.n0"))
+                && probe.isPresent(WECHAT_8080.className("w11.r0"))) {
+            return WECHAT_8080;
+        }
         if (probe.isPresent(WECHAT_8079.className("i95.n0"))
                 && probe.isPresent(WECHAT_8079.className("w11.r0"))) {
             return WECHAT_8079;
