@@ -434,7 +434,24 @@ final class WeChatVersionSymbols {
             // the OTHER class, fj0.e3) is CONFIRMED via exact signature match: Oj(fj0.n3)
             // returns hr3.f0, exactly matching (h3Class)->qi3.b0. The rest of this row is
             // carried over from 8.0.79 unverified, same as every prior first pass.
-            methods("Wi", "hk", "Bj", "Cj", "j2", "Ej", "zj", "Gj", "Ij", "Oj", "Sj", "Cj", "Gj", "Ij"),
+            // imageShortSend="Mj"/imageLongSend="Oj" CONFIRMED via exact signature match on
+            // the qh3.a1 implementer (lt5.d5): Mj(Context,String,String,int,String,String,
+            // w41.l7) and Oj(...,w41.l7,ScanCodeInfo,SourceImgInfo) are the only methods
+            // matching the expected 7-param/9-param shapes -- the 8.0.79-carried-over
+            // "Gj"/"Ij" guesses were both wrong for 8.0.80 (confirmed live: both threw
+            // NoSuchMethodException on lt5.d5).
+            // emojiManager="Ij" (was "Cj") and locationBuildTask="Mj"/locationSendTask="Oj"
+            // (was "Gj"/"Ij") all CONFIRMED live: the 8.0.79-carried-over guesses threw
+            // NoSuchMethodException on first real-device test, fixed by exact signature
+            // match against the resolved classes (see sendViaEmojiMgr's "Y"->"Z" comment for
+            // the emoji send-call overload shift found alongside this one).
+            // imageMessageLookup="k2" (was "j2") CONFIRMED via decompiled source: yx0.k0 is a
+            // Kotlin interface with several same-signature (String,long)->f9 static forwarder
+            // methods, each delegating to a different method on a singleton (Z9->.l(),
+            // cj->.n(), k2->.k()); cross-checked against 8.0.79's ox0.k0 (same interface
+            // shape) where the already-correct "j2" also delegates to ".k()" on its
+            // singleton -- k2 is the one with the matching delegate target in 8.0.80.
+            methods("Wi", "hk", "Bj", "Cj", "k2", "Ej", "zj", "Mj", "Oj", "Oj", "Sj", "Ij", "Mj", "Oj"),
             fields("x2", "i0", "k2", "j2", "l2", "C2", "t2", "B2", "m2"),
             aliases(
                     "i95.n0", "fi5.n0",

@@ -629,9 +629,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
             if (TENPAY_SIGN_FALLBACK_HOOKED.get()) {
                 return;
             }
+            Class<?> getEncryptUrlOwner = findDeclaringClass(
+                    findClass(classLoader, "com.tencent.mm.wallet_core.tenpay.model.o"),
+                    "getEncryptUrl",
+                    String.class);
             XposedHelpers.findAndHookMethod(
-                    "com.tencent.mm.wallet_core.tenpay.model.o",
-                    classLoader,
+                    getEncryptUrlOwner,
                     "getEncryptUrl",
                     String.class,
                     new XC_MethodHook() {
@@ -1093,7 +1096,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     "encrypt");
             count += deoptimizeDeclaredMethods(
                     deoptimize,
-                    findClass(classLoader, "com.tencent.mm.wallet_core.tenpay.model.o"),
+                    findDeclaringClass(
+                            findClass(classLoader, "com.tencent.mm.wallet_core.tenpay.model.o"),
+                            "getEncryptUrl",
+                            String.class),
                     "getEncryptUrl");
             count += deoptimizeDeclaredMethods(
                     deoptimize,
@@ -1135,6 +1141,30 @@ public final class HookEntry implements IXposedHookLoadPackage {
             count++;
         }
         return count;
+    }
+
+    /**
+     * WeChat 8.0.80 moved getEncryptUrl(String) off com.tencent.mm.wallet_core.tenpay.model.o
+     * (stable, unobfuscated, previously the declaring class across 8.0.75-8.0.79) up two
+     * levels to its grandparent com.tencent.mm.wallet_core.tenpay.model.n -- same signature,
+     * just a different class in the hierarchy now declares it. XposedHelpers.findAndHookMethod
+     * and Class.getDeclaredMethod() both require the EXACT declaring class, so a hardcoded
+     * "o" broke here even though nothing about the method itself changed. Walk the superclass
+     * chain from the historically-known starting class to find wherever it actually lives now,
+     * instead of hardcoding one level and breaking again the next time WeChat reshuffles this
+     * class hierarchy.
+     */
+    private static Class<?> findDeclaringClass(Class<?> startClass, String methodName, Class<?>... paramTypes)
+            throws NoSuchMethodException {
+        for (Class<?> cls = startClass; cls != null; cls = cls.getSuperclass()) {
+            try {
+                cls.getDeclaredMethod(methodName, paramTypes);
+                return cls;
+            } catch (NoSuchMethodException ignored) {
+                // keep walking up
+            }
+        }
+        throw new NoSuchMethodException(methodName + " not found on " + startClass.getName() + " or any superclass");
     }
 
     private static void logWalletClassLoaderDiagnostics(ClassLoader classLoader) {
@@ -6848,11 +6878,28 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return SendResult.failed("WeChat " + kind + " send invoked but no outgoing appmsg message was recorded");
     }
 
+    // The static send(appMsg, String, String, String, String, byte[])->Pair method on this
+    // otherwise-stable class has had its own single-letter name reassigned at least once
+    // ("I" through 8.0.79, "K" on 8.0.80, confirmed via exact signature match) even though
+    // nothing else about the class or call shape changed. Try known letters in order rather
+    // than hardcoding one, so a future reassignment degrades to a retry instead of breaking
+    // every appmsg-based send path (quote, chat-history, generic appmsg) at once.
+    private static Method findAppMsgSendMethod(Class<?> appMsgLogicClass, Class<?> appMsgClass) throws NoSuchMethodException {
+        for (String name : new String[]{"I", "K", "J", "H"}) {
+            try {
+                return findMethod(appMsgLogicClass, name, appMsgClass,
+                        String.class, String.class, String.class, String.class, byte[].class);
+            } catch (NoSuchMethodException ignored) {
+                // try the next known letter
+            }
+        }
+        throw new NoSuchMethodException(appMsgLogicClass.getName() + " appmsg send method not found under any known name");
+    }
+
     private static long sendViaAppMsgObject(ClassLoader classLoader, String wxid, Object appMsg) throws Exception {
         Class<?> appMsgClass = findVersionedClass(classLoader, "ot0.q");
         Class<?> appMsgLogicClass = findClass(classLoader, "com.tencent.mm.pluginsdk.model.app.k0");
-        Method send = findMethod(appMsgLogicClass, "I", appMsgClass,
-                String.class, String.class, String.class, String.class, byte[].class);
+        Method send = findAppMsgSendMethod(appMsgLogicClass, appMsgClass);
         Object pair = send.invoke(null, appMsg, "", "", wxid, "", null);
         return pair == null ? 0L : longPairField(pair, "second");
     }
@@ -7033,8 +7080,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         setObjectField(appMsg, quoteItem, symbols.fields.appMsgQuoteItem);
 
         Class<?> appMsgLogicClass = findClass(classLoader, "com.tencent.mm.pluginsdk.model.app.k0");
-        Method send = findMethod(appMsgLogicClass, "I", appMsgClass,
-                String.class, String.class, String.class, String.class, byte[].class);
+        Method send = findAppMsgSendMethod(appMsgLogicClass, appMsgClass);
         Object pair = send.invoke(null, appMsg, "", "", wxid, "", null);
         long newMsgId = pair == null ? 0L : longPairField(pair, "second");
         if (newMsgId <= 0L) {
@@ -7059,8 +7105,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         setObjectField(appMsg, recordItemXML, symbols.fields.appMsgRecordItem);
 
         Class<?> appMsgLogicClass = findClass(classLoader, "com.tencent.mm.pluginsdk.model.app.k0");
-        Method send = findMethod(appMsgLogicClass, "I", appMsgClass,
-                String.class, String.class, String.class, String.class, byte[].class);
+        Method send = findAppMsgSendMethod(appMsgLogicClass, appMsgClass);
         Object pair = send.invoke(null, appMsg, "", "", wxid, "", null);
         return pair == null ? 0L : longPairField(pair, "second");
     }
@@ -7383,7 +7428,16 @@ public final class HookEntry implements IXposedHookLoadPackage {
         Class<?> emojiInfoClass = findClass(classLoader, "com.tencent.mm.storage.emotion.EmojiInfo");
         Class<?> messageClass = findVersionedClass(classLoader, "com.tencent.mm.storage.f9");
         Class<?> callbackClass = findVersionedClass(classLoader, "r15.b");
-        Method send = findMethod(emojiMgr.getClass(), "Y", String.class, emojiInfoClass, messageClass, callbackClass, int.class);
+        // Was "Y" through 8.0.79; 8.0.80 reassigned the 5-param overload to "Z" and gave "Y"
+        // to a different 6-param overload (adds a MsgIdTalker we don't have) with the same
+        // leading/trailing types -- confirmed via exact signature match, not guessed. Try
+        // both rather than hardcoding one.
+        Method send;
+        try {
+            send = findMethod(emojiMgr.getClass(), "Z", String.class, emojiInfoClass, messageClass, callbackClass, int.class);
+        } catch (NoSuchMethodException unavailable) {
+            send = findMethod(emojiMgr.getClass(), "Y", String.class, emojiInfoClass, messageClass, callbackClass, int.class);
+        }
         send.invoke(emojiMgr, wxid, emojiInfoClass.cast(emojiInfo), null, null, emojiOrdinal(emojiInfo));
         log("sendEmoji invoked EmojiMgrImpl");
     }
@@ -7614,6 +7668,21 @@ public final class HookEntry implements IXposedHookLoadPackage {
         Class<?> vh4Class = findVersionedClass(classLoader, "r45.vh4");
         Class<?> p2Class = findVersionedClass(classLoader, "vf0.p2");
         Class<?> r15dClass = findVersionedClass(classLoader, "r15.d");
+        // WeChat 8.0.80 added yet another trailing String param after the three booleans
+        // that 8.0.78/8.0.79 ended on (confirmed by reading the real constructor signature
+        // directly out of the dex shape index, not guessed). Rather than add a third
+        // per-version boolean flag for every future shape tweak to this one constructor, try
+        // the known shapes newest-first and fall through, same pattern already used for the
+        // 8.0.77-vs-8.0.78 w11.r0 constructor shape difference in sendViaNetScene.
+        try {
+            Constructor<?> ctor = findConstructor(
+                    r2Class, f7Class, uf6Class, String.class, xz6Class, String.class, vh4Class,
+                    boolean.class, p2Class, String.class, r15dClass, boolean.class, boolean.class,
+                    boolean.class, String.class);
+            return ctor.newInstance(null, null, "", null, "", null, false, null, "", null, false, false, false, null);
+        } catch (NoSuchMethodException ignored) {
+            // fall through to the next known shape
+        }
         if (symbols.videoCrossParamsHasTrailingBoolean) {
             Constructor<?> ctor = findConstructor(
                     r2Class,
